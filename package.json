@@ -1,0 +1,24 @@
+{
+  "name": "chaosim-sim001",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SIM-001: ChaoSim core simulation engine and adaptive scenario director",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "chaos": "node src/index.ts",
+    "live": "node src/index.ts --live",
+    "test": "node --test"
+  },
+  "keywords": [
+    "simulation",
+    "game-loop",
+    "telemetry",
+    "deterministic",
+    "attestation"
+  ],
+  "license": "UNLICENSED"
+}
