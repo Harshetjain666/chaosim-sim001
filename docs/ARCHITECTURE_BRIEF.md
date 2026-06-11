@@ -154,6 +154,28 @@ What makes it un-gameable, concretely:
 
 And it never slows the loop because the loop only appends a frame to a ring. Encoding, compression, and hashing happen on a separate worker draining a bounded queue. If that worker falls behind, the queue applies backpressure and, at the hard limit, sheds with a counter, exactly as on the ingestion side. The prototype shows the endpoint of this pipeline: canonical serialization and HMAC in [src/attestation.ts](../src/attestation.ts). The hash chain is the production extension that turns a single end of run signature into a signature over the full ordered history.
 
+### 1.5 The Autonomous Event Engine
+
+The System Requirements describe an "Invisible Brain" that watches per candidate state every tick and, when PanicIndex stays high while CodebaseHealth falls, injects an environment mutation such as a simulated production database crash or an automated Slack message from an anxious investor. That is the same Scenario Director the prototype implements in [src/scenarioDirector.ts](../src/scenarioDirector.ts), and it is worth two specific design notes, because "sustained" and "dynamically inject" are each doing real work in that sentence.
+
+**Sustained, not instantaneous.** A single spiky tick must not trip the brain, or it would flap on and off. So the detector is a compound, hysteretic condition rather than a bare threshold: PanicIndex has to stay above a high mark for a dwell of D consecutive ticks (tracked with a small counter, or an exponential moving average compared against the mark) and CodebaseHealth has to be trending down over a short window (a sign check on its slope). Both are O(1) per tick and run inside the same tick right after the stress curve, so the brain adds nothing measurable to the hot path. The prototype uses the minimal instance of this, a single `panicIndex >= 75` latch that fires once, which is the right scope for Challenge 3. The production version keeps the same shape and swaps the bare compare for the dwell plus slope test.
+
+**Dynamically inject means a registry, not a hardcoded branch.** Mutations live in a table, each entry pairing a guard, a synchronous effect on world state, and an outbound side effect:
+
+```ts
+interface Mutation {
+  id: 'db_crash' | 'investor_slack' | 'ceo_alert';
+  guard: (s: WorldState) => boolean;          // when this one is eligible
+  apply: (s: WorldState) => void;             // authoritative state change
+  emit: (s: WorldState) => OutboundEffect;    // the simulated crash / Slack message
+  cooldownTicks: number;                       // per mutation latch
+}
+```
+
+When the detector trips, the director selects an eligible mutation deterministically (a seeded function of the current state, so the choice is reproducible and therefore signable), applies its state effect synchronously inside the tick, and enqueues the outbound side effect to a worker rather than performing it inline. The simulated database crash flips a world flag and degrades CodebaseHealth; the investor Slack message is pushed to an outbound queue and delivered off the loop. Each mutation carries its own cooldown latch so the world degrades in deliberate steps instead of a single tick storm. The prototype's once only CEO alert is exactly one row of this table with an effectively infinite cooldown.
+
+Two smaller points the System Requirements imply. The state is multi dimensional and open ended: the structure of arrays layout in 1.2 holds one column per index, so adding TechnicalDebtIndex, CofounderTension, or BurnRate is adding columns, not reworking the loop. And because the detector, the selection, and the effects are all pure functions of authoritative state, the entire decision footprint the brain produces stays deterministic and replayable, which is exactly what lets 1.4 sign it.
+
 ---
 
 ## Challenge 2: Company Brain Architecture Scenario
