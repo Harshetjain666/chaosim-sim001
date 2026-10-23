@@ -17,11 +17,19 @@ export interface Metrics {
  * behavior rather than accumulating forever.
  */
 export function computeMetrics(window: TelemetryWindow, config: EngineConfig): Metrics {
-  const perMinute = 60_000 / config.windowMs;
   return {
-    keystrokeVelocity: window.countByKind('keystroke') * perMinute,
+    keystrokeVelocity: keystrokeVelocity(window.countByKind('keystroke'), config),
     backspaceCount: window.countByKind('backspace'),
   };
+}
+
+/**
+ * The keystrokes inside the window as a rate per minute. The shard's session
+ * columns count their windows differently but convert through this too, so
+ * both paths produce the same bits.
+ */
+export function keystrokeVelocity(keystrokes: number, config: EngineConfig): number {
+  return keystrokes * (60_000 / config.windowMs);
 }
 
 /** True when the operator is in the high-stress regime defined by the spec. */

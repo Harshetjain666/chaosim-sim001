@@ -11,6 +11,8 @@
     "start": "node src/index.ts",
     "chaos": "node src/index.ts",
     "live": "node src/index.ts --live",
+    "cluster": "node src/index.ts --cluster",
+    "drill": "node src/index.ts --crash-drill",
     "test": "node --test"
   },
   "keywords": [

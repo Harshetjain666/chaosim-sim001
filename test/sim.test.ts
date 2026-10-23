@@ -6,11 +6,21 @@ import { SimulationEngine } from '../src/engine.ts';
 import { Simulation } from '../src/simulation.ts';
 import { defaultConfig } from '../src/config.ts';
 import { nextPanicIndex, isStressed } from '../src/stressModel.ts';
-import { canonicalize, sign, verify } from '../src/attestation.ts';
+import { canonicalize, sign, verify, type AttestationPayload } from '../src/attestation.ts';
 import { runChaosLoadTest } from '../src/chaosLoadTest.ts';
 import type { TelemetryEvent } from '../src/types.ts';
 
 const SECRET = 'test-secret';
+
+function attestedBody() {
+  return {
+    finalState: createWorldState(),
+    tickCount: 1,
+    trapTripped: false,
+    directorEvents: [],
+    completedAt: '2026-01-01T00:00:00.000Z',
+  };
+}
 
 test('initial world state matches the spec', () => {
   const s = createWorldState();
@@ -87,6 +97,29 @@ test('a re-signed payload uses key-sorted canonical bytes', () => {
   );
   assert.equal(att.canonical.indexOf('"ceoAnxietyIndex"') < att.canonical.indexOf('"codebaseHealth"'), true);
   assert.equal(verify(att, SECRET), true);
+});
+
+test('only schemas v1 and v2 verify, and a v2 payload must name its session', () => {
+  const v1 = sign({ schema: 'chaosim.sim001.attestation.v1', ...attestedBody() }, SECRET);
+  const v2 = sign({ schema: 'chaosim.sim001.attestation.v2', sessionId: 's1', ...attestedBody() }, SECRET);
+  assert.equal(verify(v1, SECRET), true);
+  assert.equal(verify(v2, SECRET), true);
+
+  // Both are signed with the right secret, but neither is a payload a verifier can read.
+  const unknown = { schema: 'chaosim.sim001.attestation.v3', sessionId: 's1', ...attestedBody() };
+  assert.equal(verify(sign(unknown as unknown as AttestationPayload, SECRET), SECRET), false);
+  const unnamed = { schema: 'chaosim.sim001.attestation.v2', ...attestedBody() };
+  assert.equal(verify(sign(unnamed as unknown as AttestationPayload, SECRET), SECRET), false);
+});
+
+test('an attestation verifies for a session only when it is v2 and names that session', () => {
+  const v2 = sign({ schema: 'chaosim.sim001.attestation.v2', sessionId: 's1', ...attestedBody() }, SECRET);
+  assert.equal(verify(v2, SECRET, { sessionId: 's1' }), true);
+  assert.equal(verify(v2, SECRET, { sessionId: 's2' }), false);
+
+  // A v1 payload names no session, so it could be any session's.
+  const v1 = sign({ schema: 'chaosim.sim001.attestation.v1', ...attestedBody() }, SECRET);
+  assert.equal(verify(v1, SECRET, { sessionId: 's1' }), false);
 });
 
 test('the run is deterministic: same seed yields the same fingerprint', () => {
