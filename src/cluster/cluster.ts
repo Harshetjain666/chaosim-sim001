@@ -555,7 +555,15 @@ export class ShardCluster {
   }
 }
 
-const MANIFEST_VERSION = 1;
+/**
+ * From version 2, completions are signed as attestation schema v2, which
+ * names the session. A version 1 directory was written by a build that signed
+ * v1: its checkpoints hold attestations that name no session, and replaying
+ * its logs here would sign completions differently from the attestations
+ * already issued for them, which is the same reason a changed secret is
+ * refused.
+ */
+const MANIFEST_VERSION = 2;
 
 interface Manifest {
   version: typeof MANIFEST_VERSION;

@@ -1,4 +1,5 @@
-import type { Attestation } from '../attestation.ts';
+import { sign, type Attestation } from '../attestation.ts';
+import { runChaosLoadTest } from '../chaosLoadTest.ts';
 import { defaultConfig, type EngineConfig } from '../config.ts';
 import { SimulationEngine } from '../engine.ts';
 import { mulberry32 } from '../rng.ts';
@@ -44,6 +45,19 @@ export function referenceEngine(
     engine.step(telemetryForTick(tick, config.tickMs, rng));
   }
   return engine;
+}
+
+/**
+ * The fingerprint a session run through the cluster must finish on: the
+ * payload the plain single session run signs for `seed`, signed again as
+ * schema v2 with the session's id, which is how every shard completion signs.
+ */
+export function referenceFingerprint(
+  sessionId: string,
+  options: { secret: string; seed: number; completedAt: string },
+): string {
+  const { payload } = runChaosLoadTest(options).attestation;
+  return sign({ ...payload, schema: 'chaosim.sim001.attestation.v2', sessionId }, options.secret).signature;
 }
 
 export interface DriverSession {

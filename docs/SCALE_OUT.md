@@ -28,7 +28,7 @@ The code lives in `src/cluster/`.
 
 A session goes to the shard with the highest `hash(sessionId, shard)`, which is rendezvous hashing. Plain `hash % shards` would also be stable, but growing from 4 to 5 shards would move about 80 percent of sessions, while rendezvous moves about 20 percent, only the ones the new shard now wins. Moving a session means moving its state, so the cheap time to pick the right function is before there is any state to move.
 
-Live migration is not built yet. Until it is, the shard count is fixed for the life of a data directory. `cluster.json` records its own version, the shard count, the engine config, and a keyed fingerprint of the signing secret (never the secret itself), and the cluster refuses to start against a directory written with different values. Starting with a different engine config is refused for a reason that is easy to miss: replay re-runs the engine, so a changed threshold would replay the log into a different state than the one that was lost. A different secret is refused for a similar one: replay re-signs every completion after the last checkpoint, and those attestations would no longer match the ones already handed out.
+Live migration is not built yet. Until it is, the shard count is fixed for the life of a data directory. `cluster.json` records its own version, the shard count, the engine config, and a keyed fingerprint of the signing secret (never the secret itself), and the cluster refuses to start against a directory written with different values. Starting with a different engine config is refused for a reason that is easy to miss: replay re-runs the engine, so a changed threshold would replay the log into a different state than the one that was lost. A different secret is refused for a similar one: replay re-signs every completion after the last checkpoint, and those attestations would no longer match the ones already handed out. The version is 2 since [attestations name their session](#attestations-name-their-session), and a version 1 directory is refused for the same reason.
 
 ## Ingestion: the shard is the clock
 
@@ -36,7 +36,7 @@ Telemetry arrives at the router as `(sessionId, kind, count)`. The router batche
 
 Inside the shard, each session's inbox is five counters, one per telemetry kind. That is the coalescing the brief asks for in 2.2 ("a run of file saves collapses to a count") taken to its conclusion: the inbox is constant size no matter how hard a client bursts. Each counter is capped per tick (`inboxCapPerKind`, 255 by default) and anything above the cap is counted as dropped.
 
-At each tick the counters become the tick's input. They stand for the batch the engine would be handed: every event stamped with the session's simulation time at the start of that tick, in a fixed kind order. Client timestamps are never used. Stamping at the start of the tick is exactly equivalent to the spread timestamps in the single session path, because the sliding window evicts a whole tick's events on the same later tick wherever inside the tick they landed. That equivalence is tested: a session run through a shard produces the same fingerprint as `runChaosLoadTest` with the same seed.
+At each tick the counters become the tick's input. They stand for the batch the engine would be handed: every event stamped with the session's simulation time at the start of that tick, in a fixed kind order. Client timestamps are never used. Stamping at the start of the tick is exactly equivalent to the spread timestamps in the single session path, because the sliding window evicts a whole tick's events on the same later tick wherever inside the tick they landed. That equivalence is tested: a session run through a shard signs the same payload as `runChaosLoadTest` with the same seed, plus its own session id, and its fingerprint is checked against exactly that.
 
 ## Session columns
 
@@ -92,7 +92,7 @@ The reverse failure also needs covering: an event that was released but had not 
 
 Every `checkpointEveryTicks` shard ticks (50, five seconds, as in the brief) the shard freezes all its sessions into one checkpoint. The freeze copies the session columns into the checkpoint's buffer at the end of a tick, behind a small JSON header that carries what is not a number per session: the ids in slot order, the retained attestations, and the forgotten ids. That copy is the copy on write: the live columns keep moving on the next tick while the frozen bytes go to disk. With the 2 second window a session costs 256 bytes of columns however busy that window is. The readable layout this replaced cost about 1.6 KB per session in the scenario, as JSON, and grew with every event in a window.
 
-On disk a checkpoint is the 8 byte magic `CSCKP002`, then one frame like a log record's, whose payload is `[u32 header length][header JSON][number columns][window counts]`. The columns are copied as they sit in memory, so the header names their byte order, along with the order of the kinds and the columns; a file laid out differently from the build reading it, or written on a host of the other byte order, is reported as unsupported rather than misread. A version 1 checkpoint, the JSON layout this replaced, is unsupported too, so a data directory with a checkpoint from before the change does not open; one that holds only log segments replays as before, since the log format did not change.
+On disk a checkpoint is the 8 byte magic `CSCKP002`, then one frame like a log record's, whose payload is `[u32 header length][header JSON][number columns][window counts]`. The columns are copied as they sit in memory, so the header names their byte order, along with the order of the kinds and the columns; a file laid out differently from the build reading it, or written on a host of the other byte order, is reported as unsupported rather than misread. A version 1 checkpoint, the JSON layout this replaced, is unsupported too. The log format did not change.
 
 The brief's sketch hands the write to `queueMicrotask`. That does not take anything off the loop: a microtask runs on the same thread before the next timer or I/O callback. The implementation does the write with the async `fs` API, which runs on the thread pool.
 
@@ -136,6 +136,16 @@ A cluster takes an exclusive `LOCK` file in its data directory before it touches
 
 `close()` stops every shard with a final checkpoint and rejects, naming the cause, if any shard could not. Nothing it acknowledged is lost in that case; its next start replays the log instead of starting from the final checkpoint.
 
+## Attestations name their session
+
+A standalone run signs schema v1: the final state, the tick count, the trap flag, the director events and `completedAt`. Nothing in it says which session it came from, which is fine while a process runs one session. In a cluster it would let one session's attestation be presented as another's.
+
+So every completion that goes through a shard signs schema v2, the same fields plus `sessionId`. The shard signs from its session columns through `attestCompletion` and passes the id the session is kept under, the same id the log's `complete` record names, so a completion replayed from the log signs exactly what the live one signed. The single session path (`runChaosLoadTest`, `--fixed-time`, `--live`) still signs v1, and its regression fingerprint for seed 1 did not move.
+
+`verify()` accepts v1 and v2 and nothing else, and it rejects a v2 payload that has no session id. A caller that knows which session an attestation should belong to passes `{ sessionId }`. Then only a v2 attestation naming that session verifies, since a v1 one names none and could be any session's. The cluster demo checks every attestation this way.
+
+This is why `cluster.json` is at version 2. A version 1 directory was written by a build that signed v1: its checkpoints retain attestations that name no session, and replaying its logs here would sign their completions as v2, unlike the attestations it already issued. It is refused at start, for the same reason as a changed secret.
+
 ## What survives what
 
 | Failure | Recovered | Lost |
@@ -149,7 +159,8 @@ A cluster takes an exclusive `LOCK` file in its data directory before it touches
 
 ## How it is verified
 
-* **Same answer as one session.** Sessions run through shards produce byte identical fingerprints to `runChaosLoadTest` with the same seed.
+* **Same answer as one session.** Sessions run through shards sign the payload `runChaosLoadTest` signs for the same seed, plus their session id, and every fingerprint is checked against that. Seed 1 run as session `s1` is also pinned to a value computed with `openssl`, outside this code.
+* **Session ids are signed.** A test renames the session in a shard's attestation and checks that it no longer verifies, and that the original does not verify as any other session's.
 * **The columns are the engine.** The session columns are checked against a plain `SimulationEngine` for every session after every tick, window included, as described under Session columns.
 * **Recovery is exact.** Unit tests abandon a shard at arbitrary points, recover it, and compare every session against a reference engine stepped to the same tick, and against its own snapshot from before the crash after a completion has moved it to another slot.
 * **Torn and corrupt logs.** Tests truncate and flip bytes in segments and check that a torn tail is repaired and corruption is refused.
@@ -194,4 +205,3 @@ What the numbers say:
 * **Hung worker detection.** A worker that crashes is restarted. A worker stuck in an infinite loop is not detected yet; that needs a heartbeat watchdog.
 * **More than one process.** The same router pattern applies one level up, with processes or nodes in place of threads.
 * **The socket layer.** `ShardCluster.ingest()` is where a WebSocket server plugs in. Telemetry reaches it as `(sessionId, kind, count)`, already validated and with no client timestamp.
-* **Attestations that name their session.** The signed payload (schema v1, unchanged here so the single session fingerprint stays the same) does not include the session id. With many sessions in one system, one session's signature could be presented as another's. A v2 schema should sign the session id too.

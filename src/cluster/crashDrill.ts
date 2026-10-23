@@ -5,11 +5,16 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { canonicalize } from '../attestation.ts';
-import { runChaosLoadTest } from '../chaosLoadTest.ts';
 import type { EngineSnapshot, SimulationEngine } from '../engine.ts';
 import { ShardCluster } from './cluster.ts';
 import type { RecoveryReport } from './shard.ts';
-import { SCENARIO_TICKS, ScenarioDriver, referenceEngine, type DriverSession } from './workload.ts';
+import {
+  SCENARIO_TICKS,
+  ScenarioDriver,
+  referenceEngine,
+  referenceFingerprint,
+  type DriverSession,
+} from './workload.ts';
 
 export const DRILL_COMPLETED_AT = '2026-01-01T00:00:00.000Z';
 
@@ -118,8 +123,8 @@ export async function runCrashDrill(options: CrashDrillOptions): Promise<CrashDr
         // Finish the scenario on the recovered cluster.
       }
       for (const { id, seed } of sessions) {
-        const reference = runChaosLoadTest({ secret: options.secret, seed, completedAt: DRILL_COMPLETED_AT });
-        if (driver.attestations.get(id)?.signature === reference.attestation.signature) matching += 1;
+        const reference = referenceFingerprint(id, { secret: options.secret, seed, completedAt: DRILL_COMPLETED_AT });
+        if (driver.attestations.get(id)?.signature === reference) matching += 1;
       }
     } finally {
       await cluster.close();

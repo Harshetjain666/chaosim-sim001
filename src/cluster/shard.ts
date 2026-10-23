@@ -395,7 +395,7 @@ export class Shard {
     if (session === null) {
       throw new CorruptionError(`session ${id} completed while not active`);
     }
-    const attestation = attestCompletion(session, completedAt, this.secret);
+    const attestation = attestCompletion(session, completedAt, this.secret, id);
     this.sessions.remove(id);
     this.completed.set(id, attestation);
     // Drop the oldest attestations past retention but keep their ids, and
