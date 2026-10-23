@@ -1,7 +1,7 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -105,6 +105,17 @@ test('close reports a shard that could not shut down cleanly', async (t) => {
   // Take the shard's directory away so its final checkpoint has nowhere to go.
   await rm(join(dir, 'shard-0'), { recursive: true, force: true });
   await assert.rejects(cluster.close(), /shard 0.*ENOENT/s);
+});
+
+test('a config the session columns cannot hold is refused before anything starts', async (t) => {
+  const { dir } = await harness(t);
+  const start = (overrides: Partial<ClusterOptions>) =>
+    ShardCluster.start({ dataDir: dir, shards: 2, secret: SECRET, clock: 'manual', ...overrides });
+  await assert.rejects(start({ shardConfig: { ...defaultShardConfig, inboxCapPerKind: 70_000 } }), {
+    code: 'BAD_REQUEST',
+  });
+  await assert.rejects(start({ engineConfig: { ...defaultConfig, windowMs: 50 } }), { code: 'BAD_REQUEST' });
+  assert.deepEqual(await readdir(dir), [], 'nothing was written to the data dir');
 });
 
 test('a shard that dies after coming up is restarted even while the others are still starting', () => {

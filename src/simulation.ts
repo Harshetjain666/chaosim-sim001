@@ -48,19 +48,37 @@ export class Simulation {
    */
   complete(completedAt: string = new Date().toISOString()): Attestation {
     this.completed = true;
-
-    const finalState: WorldState = { ...this.engine.state };
-    Object.freeze(finalState);
-
-    const payload: AttestationPayload = {
-      schema: 'chaosim.sim001.attestation.v1',
-      finalState,
-      tickCount: this.engine.tick,
-      trapTripped: this.engine.isTrapTripped,
-      directorEvents: this.engine.directorLog.map((event) => ({ ...event })),
+    const { engine } = this;
+    return attestCompletion(
+      { tick: engine.tick, state: engine.state, trapTripped: engine.isTrapTripped, directorLog: engine.directorLog },
       completedAt,
-    };
-
-    return sign(payload, this.secret);
+      this.secret,
+    );
   }
+}
+
+/**
+ * What `complete()` signs, for anything that holds a session's final state.
+ * The shard keeps its sessions as columns rather than engines and signs
+ * through this, so a sharded attestation is byte for byte the one a
+ * Simulation would produce.
+ */
+export function attestCompletion(
+  session: Omit<EngineSnapshot, 'window'>,
+  completedAt: string,
+  secret: string,
+): Attestation {
+  const finalState: WorldState = { ...session.state };
+  Object.freeze(finalState);
+
+  const payload: AttestationPayload = {
+    schema: 'chaosim.sim001.attestation.v1',
+    finalState,
+    tickCount: session.tick,
+    trapTripped: session.trapTripped,
+    directorEvents: session.directorLog.map((event) => ({ ...event })),
+    completedAt,
+  };
+
+  return sign(payload, secret);
 }

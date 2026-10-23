@@ -10,6 +10,7 @@ import { fsyncDir, writeFully } from './frame.ts';
 import { kindCode } from './inbox.ts';
 import { lockDataDir } from './lock.ts';
 import { shardFor } from './placement.ts';
+import { columnLayoutProblem } from './sessionTable.ts';
 import type {
   ClockMode,
   RouterMessage,
@@ -190,6 +191,11 @@ export class ShardCluster {
       throw new ClusterError('BAD_REQUEST', `shards must be a positive integer, got ${options.shards}`);
     }
     const engineConfig = options.engineConfig ?? defaultConfig;
+    const layoutProblem = columnLayoutProblem(
+      engineConfig,
+      (options.shardConfig ?? defaultShardConfig).inboxCapPerKind,
+    );
+    if (layoutProblem) throw new ClusterError('BAD_REQUEST', layoutProblem);
     await mkdir(options.dataDir, { recursive: true });
     const unlock = await lockDataDir(options.dataDir);
     try {

@@ -1,9 +1,11 @@
 import { open, readdir, readFile, rename, rm } from 'node:fs/promises';
+import { endianness } from 'node:os';
 import { join } from 'node:path';
 import type { Attestation } from '../attestation.ts';
-import type { EngineSnapshot } from '../engine.ts';
-import { CorruptionError } from './errors.ts';
-import { assertKnownFormat, encodeFrame, fsyncDir, readFrame, writeFully } from './frame.ts';
+import { TELEMETRY_KINDS } from '../types.ts';
+import { CorruptionError, UnsupportedFormatError } from './errors.ts';
+import { FRAME_HEADER_BYTES, assertKnownFormat, fsyncDir, readFrame, sealFrame, writeFully } from './frame.ts';
+import { NUMBER_COLUMNS, type SessionColumns } from './sessionTable.ts';
 
 /**
  * A shard frozen at a tick boundary. Recovery loads the newest one and replays
@@ -11,22 +13,42 @@ import { assertKnownFormat, encodeFrame, fsyncDir, readFrame, writeFully } from 
  * interval however long the shard has been running.
  */
 export interface ShardCheckpoint {
-  version: 1;
+  version: 2;
   shardId: number;
   /** Last WAL seq folded into this checkpoint. Replay starts after it. */
   seq: number;
   /** Shard ticks executed. */
   tick: number;
-  sessions: { id: string; engine: EngineSnapshot }[];
+  /** Every active session, as the shard's columns in slot order. */
+  sessions: SessionColumns;
   /** Retained completions, oldest first, so retries stay idempotent across restarts. */
   completed: { id: string; attestation: Attestation }[];
-  /** Completed ids whose attestations were dropped, oldest first. Absent in older checkpoints. */
-  forgotten?: string[];
+  /** Completed ids whose attestations were dropped, oldest first. */
+  forgotten: string[];
+}
+
+/** The JSON at the front of a checkpoint's payload. The column bytes follow it. */
+interface CheckpointHeader {
+  version: 2;
+  shardId: number;
+  seq: number;
+  tick: number;
+  /** The columns are copied as they sit in memory, so they are in the writer's byte order. */
+  byteOrder: string;
+  /** The kinds and number columns in the order their bytes follow, so a reordered build cannot misread them. */
+  kinds: readonly string[];
+  columns: readonly string[];
+  windowTicks: number;
+  /** Session ids, in slot order. */
+  sessions: string[];
+  completed: { id: string; attestation: Attestation }[];
+  forgotten: string[];
 }
 
 /** File header. The trailing digits are the format version. */
-const CHECKPOINT_MAGIC = Buffer.from('CSCKP001', 'latin1');
+const CHECKPOINT_MAGIC = Buffer.from('CSCKP002', 'latin1');
 const CHECKPOINT_FILE = /^checkpoint-(\d{16})\.ckpt$/;
+const HEADER_LENGTH_BYTES = 4;
 
 export function checkpointName(seq: number): string {
   return `checkpoint-${String(seq).padStart(16, '0')}.ckpt`;
@@ -34,12 +56,48 @@ export function checkpointName(seq: number): string {
 
 /**
  * Serialize a checkpoint. The shard calls this synchronously at the end of a
- * tick: the stringify is the copy, and once it returns the live sessions are
- * free to keep moving while the bytes go to disk.
+ * tick, and this is the freeze: once it returns, the live columns are free to
+ * keep moving while the bytes go to disk.
+ *
+ * After the magic comes one frame whose payload is
+ *
+ *   [u32 LE header length][header JSON][number columns][window counts]
+ *
+ * The JSON header carries what is not a number per session: the ids in slot
+ * order, the retained attestations, the forgotten ids. Then each number
+ * column as one float64 per session, in NUMBER_COLUMNS order, and the window
+ * counts as uint16. A session costs the same bytes however busy its window
+ * is, and the columns are copied once, straight into the frame.
  */
 export function encodeCheckpoint(checkpoint: ShardCheckpoint): Buffer {
-  const payload = Buffer.from(JSON.stringify(checkpoint), 'utf8');
-  return Buffer.concat([CHECKPOINT_MAGIC, encodeFrame(payload)]);
+  const { sessions } = checkpoint;
+  const header: CheckpointHeader = {
+    version: checkpoint.version,
+    shardId: checkpoint.shardId,
+    seq: checkpoint.seq,
+    tick: checkpoint.tick,
+    byteOrder: endianness(),
+    kinds: TELEMETRY_KINDS,
+    columns: NUMBER_COLUMNS,
+    windowTicks: sessions.windowTicks,
+    sessions: sessions.ids,
+    completed: checkpoint.completed,
+    forgotten: checkpoint.forgotten,
+  };
+  const json = Buffer.from(JSON.stringify(header), 'utf8');
+  const columns = [...NUMBER_COLUMNS.map((name) => sessions[name]), sessions.window];
+  const columnBytes = columns.reduce((total, column) => total + column.byteLength, 0);
+
+  const frameStart = CHECKPOINT_MAGIC.length;
+  const buf = Buffer.allocUnsafe(frameStart + FRAME_HEADER_BYTES + HEADER_LENGTH_BYTES + json.length + columnBytes);
+  CHECKPOINT_MAGIC.copy(buf, 0);
+  let offset = buf.writeUInt32LE(json.length, frameStart + FRAME_HEADER_BYTES);
+  offset += json.copy(buf, offset);
+  for (const column of columns) {
+    offset += Buffer.from(column.buffer, column.byteOffset, column.byteLength).copy(buf, offset);
+  }
+  sealFrame(buf, frameStart);
+  return buf;
 }
 
 /** Write atomically: temp file, fsync, rename into place, fsync the directory. */
@@ -86,16 +144,79 @@ export async function loadCheckpoint(dir: string): Promise<ShardCheckpoint | nul
   if (frame.kind !== 'frame' || frame.next !== buf.length) {
     throw new CorruptionError(`${name}: failed its checksum`);
   }
-  let checkpoint: ShardCheckpoint;
-  try {
-    checkpoint = JSON.parse(frame.payload.toString('utf8')) as ShardCheckpoint;
-  } catch {
-    throw new CorruptionError(`${name}: payload is not valid JSON`);
-  }
-  if (checkpoint.version !== 1 || checkpoint.seq !== newest) {
+  const checkpoint = decodeCheckpoint(frame.payload, name);
+  if (checkpoint.seq !== newest) {
     throw new CorruptionError(`${name}: unexpected version or seq`);
   }
   return checkpoint;
+}
+
+/**
+ * The checksum matched, so these are the bytes a shard wrote. Anything that
+ * does not add up is a bug or tampering, never a torn write.
+ */
+function decodeCheckpoint(payload: Buffer, name: string): ShardCheckpoint {
+  const corrupt = (why: string) => new CorruptionError(`${name}: ${why}`);
+  if (payload.length < HEADER_LENGTH_BYTES) throw corrupt('payload too short for its header');
+  const headerEnd = HEADER_LENGTH_BYTES + payload.readUInt32LE(0);
+  if (headerEnd > payload.length) throw corrupt('header runs past the payload');
+  let header: CheckpointHeader;
+  try {
+    header = JSON.parse(payload.toString('utf8', HEADER_LENGTH_BYTES, headerEnd)) as CheckpointHeader;
+  } catch {
+    throw corrupt('header is not valid JSON');
+  }
+  if (
+    typeof header !== 'object' ||
+    header === null ||
+    header.version !== 2 ||
+    !Number.isSafeInteger(header.tick) ||
+    !Number.isInteger(header.windowTicks) ||
+    header.windowTicks < 1 ||
+    !Array.isArray(header.sessions) ||
+    !header.sessions.every((id) => typeof id === 'string') ||
+    !Array.isArray(header.completed) ||
+    !Array.isArray(header.forgotten)
+  ) {
+    throw corrupt('unexpected version or header');
+  }
+  if (header.byteOrder !== endianness()) {
+    throw new UnsupportedFormatError(`${name} holds ${header.byteOrder} columns; this host is ${endianness()}`);
+  }
+  if (!sameNames(header.kinds, TELEMETRY_KINDS) || !sameNames(header.columns, NUMBER_COLUMNS)) {
+    throw new UnsupportedFormatError(`${name} lays out its columns differently from this build`);
+  }
+
+  const n = header.sessions.length;
+  const windowLength = n * header.windowTicks * TELEMETRY_KINDS.length;
+  const expected =
+    headerEnd + NUMBER_COLUMNS.length * n * Float64Array.BYTES_PER_ELEMENT + windowLength * Uint16Array.BYTES_PER_ELEMENT;
+  if (payload.length !== expected) throw corrupt(`columns hold ${payload.length - headerEnd} bytes, not the ${expected - headerEnd} the header implies`);
+
+  // Copy each column out: the file buffer need not be aligned for a typed array view.
+  let offset = headerEnd;
+  const take = <T extends Float64Array | Uint16Array>(column: T): T => {
+    Buffer.from(column.buffer, column.byteOffset, column.byteLength).set(payload.subarray(offset, offset + column.byteLength));
+    offset += column.byteLength;
+    return column;
+  };
+  const sessions = { ids: header.sessions, windowTicks: header.windowTicks } as SessionColumns;
+  for (const column of NUMBER_COLUMNS) sessions[column] = take(new Float64Array(n));
+  sessions.window = take(new Uint16Array(windowLength));
+
+  return {
+    version: 2,
+    shardId: header.shardId,
+    seq: header.seq,
+    tick: header.tick,
+    sessions,
+    completed: header.completed,
+    forgotten: header.forgotten,
+  };
+}
+
+function sameNames(found: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(found) && found.length === expected.length && found.every((name, i) => name === expected[i]);
 }
 
 /** Delete checkpoints older than `keepSeq`, and any temp file a crash left behind. */

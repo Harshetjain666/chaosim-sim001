@@ -32,6 +32,11 @@ export class ScenarioDirector {
     state.codebaseHealth = Math.max(0, state.codebaseHealth - config.codebaseHealthPenalty);
     state.ceoAnxietyIndex = config.ceoAnxietyOnTrap;
 
-    return [{ type: 'ceo_alert', tick, message: CEO_ALERT_MESSAGE }];
+    return [ceoAlert(tick)];
   }
+}
+
+/** The event the trap emits on the tick it trips. */
+export function ceoAlert(tick: number): DirectorEvent {
+  return { type: 'ceo_alert', tick, message: CEO_ALERT_MESSAGE };
 }

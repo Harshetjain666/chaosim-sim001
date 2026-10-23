@@ -12,7 +12,7 @@ Everything here is Node built ins: `worker_threads`, `fs`, `zlib.crc32`, `perf_h
  | ShardCluster                    |       | fixed timestep clock (liveLoop.ts)       |
  |   rendezvous placement          | ----> | Shard                                    |
  |   batched ingest per shard      |       |   inbox per session: 5 counters          |
- |   request / reply               | <---- |   one SimulationEngine per session       |
+ |   request / reply               | <---- |   sessions as typed array columns        |
  |   supervision and restart       |       |   WAL writer: group commit, async fsync  |
  +---------------------------------+       |   checkpoint every 50 ticks              |
                                            +------------------------------------------+
@@ -20,7 +20,7 @@ Everything here is Node built ins: `worker_threads`, `fs`, `zlib.crc32`, `perf_h
                                              data/shard-N/checkpoint-<seq>.ckpt
 ```
 
-The engine is untouched in its math. A shard owns many `SimulationEngine` instances and steps every active one once per shard tick. Sessions never talk to each other, so shards never coordinate on the hot path.
+The engine is untouched in its math. A shard holds its sessions as typed array columns, one slot per session, and steps every one of them once per shard tick in a single pass that runs the same stress model `SimulationEngine.step()` runs (see Session columns below). Sessions never talk to each other, so shards never coordinate on the hot path.
 
 The code lives in `src/cluster/`.
 
@@ -36,7 +36,25 @@ Telemetry arrives at the router as `(sessionId, kind, count)`. The router batche
 
 Inside the shard, each session's inbox is five counters, one per telemetry kind. That is the coalescing the brief asks for in 2.2 ("a run of file saves collapses to a count") taken to its conclusion: the inbox is constant size no matter how hard a client bursts. Each counter is capped per tick (`inboxCapPerKind`, 255 by default) and anything above the cap is counted as dropped.
 
-At each tick the shard turns the counters into the engine's batch, in a fixed kind order, every event stamped with the session's simulation time for that tick. Client timestamps are never used. Stamping at the start of the tick is exactly equivalent to the spread timestamps in the single session path, because the sliding window evicts a whole tick's events on the same later tick wherever inside the tick they landed. That equivalence is tested: a session run through a shard produces the same fingerprint as `runChaosLoadTest` with the same seed.
+At each tick the counters become the tick's input. They stand for the batch the engine would be handed: every event stamped with the session's simulation time at the start of that tick, in a fixed kind order. Client timestamps are never used. Stamping at the start of the tick is exactly equivalent to the spread timestamps in the single session path, because the sliding window evicts a whole tick's events on the same later tick wherever inside the tick they landed. That equivalence is tested: a session run through a shard produces the same fingerprint as `runChaosLoadTest` with the same seed.
+
+## Session columns
+
+A shard keeps its sessions the way Challenge 1.2 of the brief describes: a structure of arrays, not an object per session. `src/cluster/sessionTable.ts` gives every session a dense slot, with a map from session id to slot, and keeps every number in a typed array indexed by that slot:
+
+* Seven `Float64Array` columns: the session's tick, its five `WorldState` numbers, and the tick its trap tripped on, `-1` while it is armed. A director log holds at most one alert, so that one number is the whole of it.
+* The sliding window, as a ring of per tick counts of each kind (`Uint16Array`, 20 ticks of 5 kinds for the 2 second window), with a running total per kind that each tick adds to and takes from.
+* The inbox: five counters per slot.
+
+The ring is not an approximation of the engine's event list. A shard stamps every event at the start of its tick, and the window evicts a whole tick at a time, so after tick T the 2 second window holds exactly ticks T minus 19 through T. The engine only ever counts what is in its window, so counts lose nothing. A tick is three passes over the slots: every window slides one tick, the tick's counts land in the positions just freed, and then metrics, stress and the director run for every slot. That last pass calls the same functions in `src/stressModel.ts` that `SimulationEngine.step()` calls, and checks the director's latch the same way. Stepping the columns allocates nothing per session, and costs the same however busy a window is.
+
+Completing a session moves the last slot into its place, so the slots stay dense. Slot order is then a pure function of the opens, ticks and completions applied, and replaying them rebuilds it exactly. A checkpoint keeps the slots in order.
+
+`inspect` still returns an `EngineSnapshot`. The columns rebuild it, and the window comes back as the event list the engine would hold. That is how the columns are tested: for random workloads where sessions open, idle, flood and complete, under two window lengths, every session's snapshot, window included, must equal a plain `SimulationEngine` stepped with the same counts after every tick, and every completion must sign the same attestation. Ten deliberately broken versions, among them a trap that trips a tick late at exactly 75, a completion that moves a session without its window or its pending inbox, and a restore that forgets the running totals, each fail it.
+
+The single session path (`runChaosLoadTest`, the live loop, the snapshot tests) keeps the readable engine. It is the reference the columns answer to.
+
+The layout brings two limits, and the cluster refuses to start outside them: a session can land at most 65,535 events of one kind in one tick, so `inboxCapPerKind` goes up to 65,535, and the window must be whole milliseconds and at least one tick long.
 
 ## The log records inputs, not state
 
@@ -48,7 +66,7 @@ So the log is a command log. Each record is one of:
 * `tick`: the shard ran tick T, with the inbox counters of every session that had input. Sessions not listed stepped with an empty batch.
 * `complete`: a session was sealed, with the `completedAt` stamp that went into its attestation.
 
-Recovery replays these through the same code paths the live shard uses, so `SimulationEngine.step()` does the reconstruction. Because `step()` is pure and deterministic, the result is identical to the lost state, not approximately equal to it.
+Recovery replays these through the same code paths the live shard uses, so the shard's own tick does the reconstruction. Because the tick is pure and deterministic, the result is identical to the lost state, not approximately equal to it.
 
 Every record carries a monotonic sequence number. Replay skips anything at or below the checkpoint's sequence number and refuses to run across a gap.
 
@@ -72,7 +90,9 @@ The reverse failure also needs covering: an event that was released but had not 
 
 ## Checkpoints
 
-Every `checkpointEveryTicks` shard ticks (50, five seconds, as in the brief) the shard freezes all its sessions into one snapshot. The freeze is a synchronous `JSON.stringify` at the end of a tick. With a readable object per session that is the copy on write: the live objects keep mutating on the next tick while the frozen string goes to disk.
+Every `checkpointEveryTicks` shard ticks (50, five seconds, as in the brief) the shard freezes all its sessions into one checkpoint. The freeze copies the session columns into the checkpoint's buffer at the end of a tick, behind a small JSON header that carries what is not a number per session: the ids in slot order, the retained attestations, and the forgotten ids. That copy is the copy on write: the live columns keep moving on the next tick while the frozen bytes go to disk. A session costs 256 bytes of columns however busy its window is. The readable layout this replaced cost about 1.6 KB per session in the scenario, as JSON, and grew with every event in a window.
+
+On disk a checkpoint is the 8 byte magic `CSCKP002`, then one frame like a log record's, whose payload is `[u32 header length][header JSON][number columns][window counts]`. The columns are copied as they sit in memory, so the header names their byte order, along with the order of the kinds and the columns; a file laid out differently from the build reading it, or written on a host of the other byte order, is reported as unsupported rather than misread. A version 1 checkpoint, the JSON layout this replaced, is unsupported too, so a data directory written before the change does not open. The log format did not change.
 
 The brief's sketch hands the write to `queueMicrotask`. That does not take anything off the loop: a microtask runs on the same thread before the next timer or I/O callback. The implementation does the write with the async `fs` API, which runs on the thread pool.
 
@@ -130,7 +150,8 @@ A cluster takes an exclusive `LOCK` file in its data directory before it touches
 ## How it is verified
 
 * **Same answer as one session.** Sessions run through shards produce byte identical fingerprints to `runChaosLoadTest` with the same seed.
-* **Recovery is exact.** Unit tests abandon a shard at arbitrary points, recover it, and compare every session against a reference engine stepped to the same tick.
+* **The columns are the engine.** The session columns are checked against a plain `SimulationEngine` for every session after every tick, window included, as described under Session columns.
+* **Recovery is exact.** Unit tests abandon a shard at arbitrary points, recover it, and compare every session against a reference engine stepped to the same tick, and against its own snapshot from before the crash after a completion has moved it to another slot.
 * **Torn and corrupt logs.** Tests truncate and flip bytes in segments and check that a torn tail is repaired and corruption is refused.
 * **A worker dies.** `ShardCluster.killShard()` terminates a worker mid run; the supervisor restarts it, a request made while it was down is answered by the recovered worker, and the run finishes with the reference fingerprints.
 * **The contracts.** Tests start a second cluster on a locked directory, cut an advance short with a kill, crash a shard whose alerts are already folded into a checkpoint, and pull a shard's directory out from under `close()`, and check each is reported or recovered as described above.
@@ -140,26 +161,35 @@ The second kill is the one that proves nothing durable was lost. A process kille
 
 ## Measured
 
-Apple M5 Pro with 18 cores, macOS, Node 25.9, the internal SSD. Four shards, 30 seconds in real time through all three phases of the scenario (`--cluster --sessions=N`), reporting the worst shard in any one second window:
+Apple M5 Pro with 18 cores, macOS, Node 25.9, the internal SSD, with other work running on the machine (load average around 5). Four shards, 30 seconds in real time through all three phases of the scenario (`--cluster --sessions=N`), reporting the worst shard in any one second window. Each size ran two or three times: up to 10,000 sessions per shard one run killed shard 0 at 21 seconds and the others kept every shard alive (`--kill-at=0`); both 20,000 runs kept every shard alive. A range is the spread across the runs:
+
+| Sessions per shard | Tick work | Loop lag p99 | Checkpoint | Checkpoint freeze | fsync p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | 0.7% of one core | 1.8ms to 3.2ms | 268 KB | 0.4ms to 0.5ms | 68ms to 82ms |
+| 2,500 | 1.7% to 1.8% of one core | 2.1ms to 2.2ms | 667 KB | 0.6ms to 1.2ms | 68ms to 78ms |
+| 10,000 | 3.6% to 4.6% of one core | 4.3ms to 6.4ms | 2.7 MB | 1.4ms to 5.9ms | 63ms to 295ms |
+| 20,000 | 6.5% to 8.9% of one core | 14.5ms to 14.7ms | 5.3 MB | 2.1ms to 10.4ms | 26ms to 348ms |
+
+The same runs with one readable object per session, before the session columns:
 
 | Sessions per shard | Tick work | Loop lag p99 | Checkpoint | Checkpoint freeze | fsync p99 |
 | --- | --- | --- | --- | --- | --- |
 | 1,000 | 3.2% of one core | 4.5ms | 1.6 MB | 7.8ms | 60ms |
 | 2,500 | 5.0% of one core | 9.8ms | 4.1 MB | 13.0ms | 126ms |
-| 10,000 | 16.7% of one core | 13.7ms | 16.5 MB | 73.8ms | 75ms |
+| 10,000 | 14.6% to 16.7% of one core | 13.5ms to 13.7ms | 16.5 MB | 45.3ms to 73.8ms | 16ms to 75ms |
 
 What the numbers say:
 
-* **CPU is not the limit.** 10,000 sessions on one shard, through the failure cascade, which is the busiest stretch of the scenario, peaked at 17 percent of one core.
-* **The checkpoint freeze is.** Turning readable session objects into a checkpoint costs 5 to 8ms per thousand sessions, on the loop. At 10,000 sessions per shard that is 74ms every five seconds, most of a tick. With the current layout, keep shards nearer 5,000 sessions. The structure of arrays layout from Challenge 1.2 turns the freeze into a column copy and removes this ceiling.
-* **fsync here is the drive flushing its cache,** 40 to 60ms typically with four shards writing. Group commit absorbs it: a flush slower than a tick simply carries more ticks, which stretches the loss window toward 200ms and no further. Raising the libuv thread pool from 4 to 16 threads changed nothing measurable at four shards. On Linux with an NVMe drive, fdatasync usually takes well under a millisecond.
-* **Recovery is fast.** A shard holding 1,000 sessions, killed mid run, was back in 20ms after replaying 11 ticks. At 2,500 sessions it took 43ms for 13 ticks.
+* **The checkpoint freeze is no longer the ceiling.** At 10,000 sessions per shard a checkpoint stopped the loop for at most 5.9ms across three runs, against 45 to 74ms before, and the file is a sixth of the size. Measured in process, the copy itself takes about 0.4ms at 10,000 sessions and 1ms at 20,000. The higher readings are the worker's garbage collector pausing in the middle of a freeze, not the copy: a run with `--trace-gc` at 20,000 sessions per shard showed scavenges of up to 13ms and full collections of up to 17ms in every shard's worker.
+* **CPU fell by about two thirds.** At 10,000 sessions per shard the busiest second of the cascade took 3.6 to 4.6 percent of one core, against 15 to 17 before. Measured in process at that size, a tick costs about 1.4ms: 0.3ms emptying the inboxes into the tick's input, 0.4ms encoding the log record as JSON, and 0.7ms stepping the columns.
+* **What the loop spends its time on now.** At 20,000 sessions per shard, taking in one 100ms round of batched telemetry (a message of about 130,000 values, then an inbox increment per item) and running the tick costs a worker 5 to 11ms, more than the freeze, and the garbage that the per tick JSON and the per message arrays leave behind is what the collector pauses for. That is where loop lag p99 comes from now. A log record that refers to sessions by slot in binary, and telemetry posted as a transferable buffer rather than an array, are the next steps if a shard needs to hold more.
+* **fsync here is the drive flushing its cache,** 60 to 80ms at p99 with four shards writing, and up to 350ms in runs where other work on the machine was writing too. Group commit absorbs it: a flush slower than a tick simply carries more ticks, so the loss window is the slowest flush plus a tick. Raising the libuv thread pool from 4 to 16 threads changed nothing measurable at four shards. On Linux with an NVMe drive, fdatasync usually takes well under a millisecond.
+* **Recovery is quick, and mostly the drive.** A shard holding 1,000 sessions, killed mid run, was back in 44ms after replaying 12 ticks; at 2,500 sessions it took 55ms for 13 ticks, and at 10,000 sessions 88ms for 22 ticks. Most of that is the syncs of reopening the log. The CPU side at 10,000 sessions, reading and decoding the checkpoint, loading its columns and replaying 22 ticks, measures about 23ms in process.
 * **The log is cheap but not small.** As JSON it costs about 25 bytes per active session per tick, about 2.6 MB/s per shard at 10,000 sessions in the cascade. A binary codec that refers to sessions by slot would cut that roughly fourfold if bandwidth ever matters.
 
 ## Not built yet
 
 * **Session migration.** The health signal exists (per shard event loop delay and tick busy time are reported), but nothing moves sessions yet. Moving one needs a handoff: fence the old owner, ship the snapshot, flip the route. The snapshot half exists.
-* **Structure of arrays.** Sessions are still one readable object each. Flipping to typed array columns from Challenge 1.2 would make checkpoints a column copy instead of a stringify.
 * **Replication.** The log is on a local volume. Shipping it to a second node is the next durability step.
 * **Hung worker detection.** A worker that crashes is restarted. A worker stuck in an infinite loop is not detected yet; that needs a heartbeat watchdog.
 * **More than one process.** The same router pattern applies one level up, with processes or nodes in place of threads.

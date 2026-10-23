@@ -3,7 +3,7 @@ import type { Attestation } from '../attestation.ts';
 import type { EngineConfig, ShardConfig } from '../config.ts';
 import type { EngineSnapshot } from '../engine.ts';
 import type { DirectorEvent } from '../scenarioDirector.ts';
-import { Simulation } from '../simulation.ts';
+import { attestCompletion } from '../simulation.ts';
 import {
   encodeCheckpoint,
   loadCheckpoint,
@@ -12,7 +12,7 @@ import {
   type ShardCheckpoint,
 } from './checkpoint.ts';
 import { ClusterError, CorruptionError } from './errors.ts';
-import { Inbox, expandBatch } from './inbox.ts';
+import { SessionTable } from './sessionTable.ts';
 import {
   WalWriter,
   repairTornTail,
@@ -93,11 +93,6 @@ export interface ShardOptions {
   onFatal?: (error: Error) => void;
 }
 
-interface Session {
-  sim: Simulation;
-  inbox: Inbox;
-}
-
 interface HeldEvent {
   seq: number;
   published: PublishedEvent;
@@ -119,13 +114,13 @@ export class Shard {
   private readonly dir: string;
   private readonly shardId: number;
   private readonly secret: string;
-  private readonly engineConfig: EngineConfig;
   private readonly shardConfig: ShardConfig;
   private readonly onEvents: ((events: PublishedEvent[]) => void) | undefined;
   private readonly onFatal: ((error: Error) => void) | undefined;
   private readonly wal: WalWriter;
 
-  private readonly sessions = new Map<string, Session>();
+  /** Every active session, as typed array columns. */
+  private readonly sessions: SessionTable;
   private readonly completed = new Map<string, Attestation>();
   /** Completed ids whose attestations were dropped, oldest first. */
   private readonly forgotten = new Set<string>();
@@ -147,15 +142,15 @@ export class Shard {
     lastDurationMs: 0,
   };
 
-  private constructor(options: ShardOptions, wal: WalWriter) {
+  private constructor(options: ShardOptions, wal: WalWriter, sessions: SessionTable) {
     this.dir = options.dir;
     this.shardId = options.shardId;
     this.secret = options.secret;
-    this.engineConfig = options.engineConfig;
     this.shardConfig = options.shardConfig;
     this.onEvents = options.onEvents;
     this.onFatal = options.onFatal;
     this.wal = wal;
+    this.sessions = sessions;
   }
 
   /**
@@ -166,6 +161,8 @@ export class Shard {
    */
   static async open(options: ShardOptions): Promise<{ shard: Shard; recovery: RecoveryReport }> {
     const started = performance.now();
+    // Built first: settings the columns cannot hold fail before the disk is touched.
+    const sessions = new SessionTable(options.engineConfig, options.shardConfig.inboxCapPerKind);
     await mkdir(options.dir, { recursive: true });
     const checkpoint = await loadCheckpoint(options.dir);
     const afterSeq = checkpoint?.seq ?? 0;
@@ -175,7 +172,7 @@ export class Shard {
     if (scan.tornTail) await repairTornTail(scan.tornTail);
 
     const wal = await WalWriter.open(options.dir, scan.lastSeq + 1);
-    const shard = new Shard(options, wal);
+    const shard = new Shard(options, wal, sessions);
     let ticksReplayed = 0;
     try {
       if (checkpoint) shard.restore(checkpoint);
@@ -225,12 +222,9 @@ export class Shard {
 
   /** Count telemetry into a session's inbox for its next tick. Never touches the log. */
   ingest(id: string, code: number, count: number): void {
-    const session = this.sessions.get(id);
-    if (session === undefined) {
-      this.unknownSessionDrops += count;
-      return;
-    }
-    this.inboxDrops += count - session.inbox.add(code, count);
+    const accepted = this.sessions.ingest(id, code, count);
+    if (accepted === null) this.unknownSessionDrops += count;
+    else this.inboxDrops += count - accepted;
   }
 
   /**
@@ -244,11 +238,7 @@ export class Shard {
     if (this.sessions.size === 0) return;
 
     const tick = this.shardTick;
-    const inputs: TickInput[] = [];
-    for (const [id, session] of this.sessions) {
-      const counts = session.inbox.drain();
-      if (counts) inputs.push([id, counts]);
-    }
+    const inputs = this.sessions.drain();
     const seq = this.wal.append({ op: 'tick', tick, inputs });
     for (const published of this.applyTick(tick, inputs)) this.held.push({ seq, published });
 
@@ -300,13 +290,13 @@ export class Shard {
   }
 
   inspect(id: string): SessionView | null {
-    const session = this.sessions.get(id);
-    if (session) {
+    const snapshot = this.sessions.snapshot(id);
+    if (snapshot) {
       return {
         status: 'active',
         shardTick: this.shardTick,
         durable: this.wal.durableSeq >= this.wal.lastSeq,
-        snapshot: session.sim.engine.snapshot(),
+        snapshot,
       };
     }
     const attestation = this.completed.get(id);
@@ -375,9 +365,7 @@ export class Shard {
     const events: PublishedEvent[] = [];
     const add = (sessionId: string, event: DirectorEvent) =>
       events.push({ sessionId, shardId: this.shardId, replayed: true, event: { ...event } });
-    for (const [id, session] of this.sessions) {
-      for (const event of session.sim.engine.directorLog) add(id, event);
-    }
+    for (const { id, event } of this.sessions.trapEvents()) add(id, event);
     for (const [id, attestation] of this.completed) {
       for (const event of attestation.payload.directorEvents) add(id, event);
     }
@@ -388,41 +376,27 @@ export class Shard {
     if (this.sessions.has(id) || this.completed.has(id) || this.forgotten.has(id)) {
       throw new CorruptionError(`session ${id} opened twice`);
     }
-    this.sessions.set(id, this.newSession(new Simulation({ secret: this.secret, config: this.engineConfig })));
+    this.sessions.open(id);
   }
 
   private applyTick(tick: number, inputs: readonly TickInput[]): PublishedEvent[] {
     if (tick !== this.shardTick) {
       throw new CorruptionError(`tick record ${tick} found while the shard is at tick ${this.shardTick}`);
     }
-    const countsById = new Map<string, number[]>();
-    for (const [id, counts] of inputs) {
-      if (!this.sessions.has(id) || countsById.has(id)) {
-        throw new CorruptionError(`tick ${tick} carries input for unknown or repeated session ${id}`);
-      }
-      countsById.set(id, counts);
-    }
-
-    const published: PublishedEvent[] = [];
-    for (const [id, session] of this.sessions) {
-      const counts = countsById.get(id);
-      const t = session.sim.engine.tick * this.engineConfig.tickMs;
-      const result = session.sim.step(counts ? expandBatch(counts, t) : []);
-      for (const event of result.events) {
-        published.push({ sessionId: id, shardId: this.shardId, replayed: false, event: { ...event } });
-      }
-    }
+    const published = this.sessions
+      .step(inputs)
+      .map(({ id, event }): PublishedEvent => ({ sessionId: id, shardId: this.shardId, replayed: false, event }));
     this.shardTick += 1;
     return published;
   }
 
   private applyComplete(id: string, completedAt: string): Attestation {
-    const session = this.sessions.get(id);
-    if (session === undefined) {
+    const session = this.sessions.summary(id);
+    if (session === null) {
       throw new CorruptionError(`session ${id} completed while not active`);
     }
-    const attestation = session.sim.complete(completedAt);
-    this.sessions.delete(id);
+    const attestation = attestCompletion(session, completedAt, this.secret);
+    this.sessions.remove(id);
     this.completed.set(id, attestation);
     // Drop the oldest attestations past retention but keep their ids, and
     // past that retention forget the oldest ids too. Replay runs this same
@@ -447,16 +421,9 @@ export class Shard {
     }
     this.shardTick = checkpoint.tick;
     this.checkpointStats.lastSeq = checkpoint.seq;
-    for (const { id, engine } of checkpoint.sessions) {
-      const sim = new Simulation({ secret: this.secret, config: this.engineConfig, snapshot: engine });
-      this.sessions.set(id, this.newSession(sim));
-    }
+    this.sessions.load(checkpoint.sessions);
     for (const { id, attestation } of checkpoint.completed) this.completed.set(id, attestation);
-    for (const id of checkpoint.forgotten ?? []) this.forgotten.add(id);
-  }
-
-  private newSession(sim: Simulation): Session {
-    return { sim, inbox: new Inbox(this.shardConfig.inboxCapPerKind) };
+    for (const id of checkpoint.forgotten) this.forgotten.add(id);
   }
 
   private release(durableSeq: number): void {
@@ -526,11 +493,11 @@ export class Shard {
 
   private freeze(seq: number): ShardCheckpoint {
     return {
-      version: 1,
+      version: 2,
       shardId: this.shardId,
       seq,
       tick: this.shardTick,
-      sessions: [...this.sessions].map(([id, session]) => ({ id, engine: session.sim.engine.snapshot() })),
+      sessions: this.sessions.columns(),
       completed: [...this.completed].map(([id, attestation]) => ({ id, attestation })),
       forgotten: [...this.forgotten],
     };

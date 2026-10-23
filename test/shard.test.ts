@@ -8,7 +8,7 @@ import { defaultConfig, defaultShardConfig, type ShardConfig } from '../src/conf
 import { runChaosLoadTest } from '../src/chaosLoadTest.ts';
 import { CEO_ALERT_MESSAGE } from '../src/scenarioDirector.ts';
 import type { EngineSnapshot } from '../src/engine.ts';
-import { Inbox, expandBatch, kindCode } from '../src/cluster/inbox.ts';
+import { kindCode } from '../src/cluster/inbox.ts';
 import { Shard, type PublishedEvent } from '../src/cluster/shard.ts';
 import { checkpointName } from '../src/cluster/checkpoint.ts';
 import { segmentName } from '../src/cluster/wal.ts';
@@ -102,23 +102,6 @@ function assertMatchesReference(shard: Shard, id: string, seed: number, ticks: n
   assert.deepEqual(snapshot.directorLog, reference.directorLog, `${id} director log`);
 }
 
-test('the inbox counts per kind, caps a burst, and drains in canonical order', () => {
-  const inbox = new Inbox(3);
-  assert.equal(inbox.drain(), null);
-  assert.equal(inbox.add(kindCode('backspace'), 2), 2);
-  assert.equal(inbox.add(kindCode('backspace'), 5), 1);
-  assert.equal(inbox.add(kindCode('keystroke'), 1), 1);
-  assert.deepEqual(inbox.drain(), [1, 3, 0, 0, 0]);
-  assert.equal(inbox.drain(), null);
-
-  assert.deepEqual(expandBatch([1, 2, 0, 1, 0], 700), [
-    { t: 700, kind: 'keystroke' },
-    { t: 700, kind: 'backspace' },
-    { t: 700, kind: 'backspace' },
-    { t: 700, kind: 'fileSave' },
-  ]);
-});
-
 test('sessions stepped by a shard reproduce the single session fingerprints', async (t) => {
   const dir = await tempDir(t);
   const { shard } = await openShard(dir);
@@ -160,6 +143,29 @@ test('recovery after a crash is exact and the run finishes on the reference fing
     const reference = runChaosLoadTest({ secret: SECRET, seed, completedAt: AT });
     assert.equal(attestation.signature, reference.attestation.signature, `seed ${seed}`);
   }
+  await second.close();
+});
+
+test('recovery brings back the exact sessions, windows and all, after a completion moved one', async (t) => {
+  const dir = await tempDir(t);
+  const workloads = workloadsFor([71, 72, 73, 74]);
+  const { shard: first } = await openShard(dir);
+  for (const id of workloads.keys()) first.openSession(id);
+  await drive(first, workloads, 0, 20);
+  await first.complete('s72', AT); // the last session moves into its slot
+  workloads.delete('s72');
+  await drive(first, workloads, 20, 63);
+  await waitFor(() => first.takeStats().checkpoints.written === 1, 'the checkpoint at tick 50');
+  const before = [...workloads.keys()].map((id) => activeSnapshot(first, id));
+  await crash(first);
+
+  const { shard: second, recovery } = await openShard(dir);
+  assert.equal(recovery.ticksReplayed, 13, 'checkpoint at tick 50, crash at 63');
+  assert.deepEqual(
+    [...workloads.keys()].map((id) => activeSnapshot(second, id)),
+    before,
+  );
+  for (const seed of [71, 73, 74]) assertMatchesReference(second, `s${seed}`, seed, 63);
   await second.close();
 });
 

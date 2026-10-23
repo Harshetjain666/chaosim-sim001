@@ -9,9 +9,11 @@ import type { TelemetryEvent, TelemetryKind } from './types.ts';
  * Anything older than `windowMs` is evicted so memory stays flat regardless of
  * how long the session runs.
  *
- * The backing store is a plain array used as a FIFO. For a prototype with a
- * 2s window this is cheap; the production note in the brief covers swapping it
- * for a preallocated ring buffer once sessions number in the thousands.
+ * The backing store is a plain array used as a FIFO, which is cheap for one
+ * session with a 2s window. A shard holds thousands of sessions and keeps the
+ * same window as a ring of per tick counts in typed arrays
+ * (src/cluster/sessionTable.ts). This readable version is the reference the
+ * ring is tested against.
  */
 export class TelemetryWindow {
   private readonly windowMs: number;

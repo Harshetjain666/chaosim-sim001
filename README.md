@@ -62,9 +62,10 @@ src/
     protocol.ts        messages between the router and a shard worker
     shardWorker.ts     worker thread entry: one shard, its clock, its health metrics
     shard.ts           sessions, ticks, output commit, checkpoints, recovery
-    inbox.ts           per session coalescing inbox (counts, not events)
+    sessionTable.ts    every session as typed array columns: window ring, inbox, the tick in one pass
+    inbox.ts           telemetry kind codes and the batch a tick's counts stand for
     wal.ts             write ahead log: segments, group commit, torn tail scan
-    checkpoint.ts      atomic checkpoints
+    checkpoint.ts      atomic checkpoints: a JSON header and a copy of the columns
     frame.ts           length and crc32 framing, fsync helpers
     errors.ts          corruption and cluster errors
     workload.ts        scenario workloads, the reference engine, the lockstep driver
@@ -75,6 +76,8 @@ test/
   sim.test.ts          determinism, trap once, stress curve, attestation
   snapshot.test.ts     freezing and resuming the engine
   wal.test.ts          log format, group commit, torn and corrupt logs
+  sessionTable.test.ts the session columns against the plain engine, tick by tick
+  checkpoint.test.ts   checkpoint layout, byte order, format versions
   shard.test.ts        recovery, output commit, checkpoints, idempotent completion
   cluster.test.ts      placement, sharded runs, shard kill, restart, manifest, crash loops
   crashDrill.test.ts   the SIGKILL drill
@@ -86,10 +89,10 @@ docs/
 
 ## Design in one paragraph
 
-The whole engine reduces to one idea: the world only ever changes inside `SimulationEngine.step()`, and that method is a pure function of the previous state and the telemetry batch for the tick. No wall clock leaks into the math, no client is trusted to compute anything, and the only side channel out is the signed attestation. Because the tick is pure and deterministic, the live loop, the chaos test, and the unit tests all drive the identical logic, and a given seed always reproduces the same trajectory. Everything else (the sliding window, the stress curve, the director, the signer) hangs off that spine.
+The whole engine reduces to one idea: the world only ever changes inside `SimulationEngine.step()`, and that method is a pure function of the previous state and the telemetry batch for the tick. No wall clock leaks into the math, no client is trusted to compute anything, and the only side channel out is the signed attestation. Because the tick is pure and deterministic, the live loop, the chaos test, and the unit tests all drive the identical logic, and a given seed always reproduces the same trajectory. The shards run that same step over their sessions held as typed array columns, and are tested against it tick for tick. Everything else (the sliding window, the stress curve, the director, the signer) hangs off that spine.
 
 ## Configuration
 
 `CHAOSIM_SECRET` sets the HMAC key (defaults to a development key). Pass `--seed=N` to vary the synthetic telemetry while keeping the run reproducible. Pass `--fixed-time` to stamp a constant completion time so the fingerprint itself is reproducible across runs.
 
-The crash drill takes `--shards=N`, `--sessions=N`, and `--kill-after=T` to pin the first kill to tick T instead of a random one. A cluster's data directory remembers its shard count, engine config and signing secret (as a keyed fingerprint) and refuses to start with different ones, because placement, replay and already issued attestations depend on them. Only one process can use a data directory at a time. Shard tunables (checkpoint interval, inbox cap, retained completions) live next to the engine's in `src/config.ts` and are free to change between runs.
+The crash drill takes `--shards=N`, `--sessions=N`, and `--kill-after=T` to pin the first kill to tick T instead of a random one. A cluster's data directory remembers its shard count, engine config and signing secret (as a keyed fingerprint) and refuses to start with different ones, because placement, replay and already issued attestations depend on them. Only one process can use a data directory at a time. Shard tunables (checkpoint interval, inbox cap, retained completions) live next to the engine's in `src/config.ts` and are free to change between runs. The inbox cap goes up to 65,535, the widest count a session column holds, and the engine's window must be whole milliseconds and at least one tick long; the cluster refuses anything else at start.

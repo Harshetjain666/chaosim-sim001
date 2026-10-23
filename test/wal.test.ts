@@ -247,7 +247,7 @@ test('a segment or checkpoint in a newer format is unsupported, not corrupt', as
     return true;
   });
 
-  await writeFile(join(dir, checkpointName(5)), Buffer.from('CSCKP002 and whatever a newer build wrote', 'latin1'));
+  await writeFile(join(dir, checkpointName(5)), Buffer.from('CSCKP003 and whatever a newer build wrote', 'latin1'));
   await assert.rejects(loadCheckpoint(dir), UnsupportedFormatError);
 });
 

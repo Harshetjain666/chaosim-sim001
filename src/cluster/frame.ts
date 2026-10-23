@@ -19,10 +19,20 @@ const MAX_PAYLOAD_BYTES = 256 * 1024 * 1024;
 
 export function encodeFrame(payload: Buffer): Buffer {
   const frame = Buffer.allocUnsafe(FRAME_HEADER_BYTES + payload.length);
-  frame.writeUInt32LE(payload.length, 0);
-  frame.writeUInt32LE(crc32(payload), 4);
   payload.copy(frame, FRAME_HEADER_BYTES);
+  sealFrame(frame, 0);
   return frame;
+}
+
+/**
+ * Frame a payload that was written in place: `buf` has FRAME_HEADER_BYTES
+ * free at `start` and the payload from there to its end. A checkpoint builds
+ * its payload this way so its columns are copied once, not twice.
+ */
+export function sealFrame(buf: Buffer, start: number): void {
+  const payload = buf.subarray(start + FRAME_HEADER_BYTES);
+  buf.writeUInt32LE(payload.length, start);
+  buf.writeUInt32LE(crc32(payload), start + 4);
 }
 
 export type FrameRead =
