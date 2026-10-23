@@ -4,21 +4,26 @@ import { appendFile, chmod, mkdtemp, readdir, rm, writeFile } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { verify } from '../src/attestation.ts';
 import { defaultConfig, defaultShardConfig, type ShardConfig } from '../src/config.ts';
-import { runChaosLoadTest } from '../src/chaosLoadTest.ts';
 import { CEO_ALERT_MESSAGE } from '../src/scenarioDirector.ts';
 import type { EngineSnapshot } from '../src/engine.ts';
 import { Inbox, expandBatch, kindCode } from '../src/cluster/inbox.ts';
 import { Shard, type PublishedEvent } from '../src/cluster/shard.ts';
 import { checkpointName } from '../src/cluster/checkpoint.ts';
 import { segmentName } from '../src/cluster/wal.ts';
-import { referenceEngine, scenarioCounts } from '../src/cluster/workload.ts';
+import { referenceEngine, referenceFingerprint, scenarioCounts } from '../src/cluster/workload.ts';
 
 const config = defaultConfig;
 const SECRET = 'sim-001-dev-secret';
 const AT = '2026-01-01T00:00:00.000Z';
-/** `node src/index.ts --fixed-time` prints this for seed 1; it is the regression anchor. */
-const SEED_1_FINGERPRINT = '27b60516caf74574b21dc5ceda61acb3f0a46a29ef552a81a2e13b228a2c24b6';
+/**
+ * Seed 1 run as session `s1`. Derived outside this code base: the canonical
+ * bytes behind the single session anchor (`node src/index.ts --fixed-time`),
+ * with the schema set to v2 and `"sessionId":"s1"` added after it, signed by
+ * `openssl dgst -sha256 -hmac`.
+ */
+const S1_SEED_1_FINGERPRINT = 'a6b44f2e428bab60445f18a1303c999e3c517eed9f1dff0c46caac909a256c23';
 
 async function tempDir(t: TestContext): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'chaosim-shard-'));
@@ -119,7 +124,7 @@ test('the inbox counts per kind, caps a burst, and drains in canonical order', (
   ]);
 });
 
-test('sessions stepped by a shard reproduce the single session fingerprints', async (t) => {
+test('sessions stepped by a shard sign the single session results under their own ids', async (t) => {
   const dir = await tempDir(t);
   const { shard } = await openShard(dir);
   const seeds = [1, 2, 3, 4, 5];
@@ -130,11 +135,30 @@ test('sessions stepped by a shard reproduce the single session fingerprints', as
 
   const signatures = new Map<number, string>();
   for (const seed of seeds) signatures.set(seed, (await shard.complete(`s${seed}`, AT)).signature);
-  assert.equal(signatures.get(1), SEED_1_FINGERPRINT);
+  assert.equal(signatures.get(1), S1_SEED_1_FINGERPRINT);
+  assert.equal(referenceFingerprint('s1', { secret: SECRET, seed: 1, completedAt: AT }), S1_SEED_1_FINGERPRINT);
   for (const seed of seeds) {
-    const reference = runChaosLoadTest({ secret: SECRET, seed, completedAt: AT });
-    assert.equal(signatures.get(seed), reference.attestation.signature, `seed ${seed}`);
+    const reference = referenceFingerprint(`s${seed}`, { secret: SECRET, seed, completedAt: AT });
+    assert.equal(signatures.get(seed), reference, `seed ${seed}`);
   }
+  await shard.close();
+});
+
+test('an attestation names its session, so it cannot pass for another one', async (t) => {
+  const dir = await tempDir(t);
+  const { shard } = await openShard(dir);
+  shard.openSession('s1');
+  shard.step();
+  const attestation = await shard.complete('s1', AT);
+  const { payload } = attestation;
+  assert.ok(payload.schema === 'chaosim.sim001.attestation.v2', `schema ${payload.schema}`);
+  assert.equal(payload.sessionId, 's1');
+  assert.equal(verify(attestation, SECRET, { sessionId: 's1' }), true);
+  assert.equal(verify(attestation, SECRET, { sessionId: 's2' }), false);
+
+  const renamed = { ...attestation, payload: { ...payload, sessionId: 's2' } };
+  assert.equal(verify(renamed, SECRET), false);
+  assert.equal(verify(renamed, SECRET, { sessionId: 's2' }), false);
   await shard.close();
 });
 
@@ -157,8 +181,8 @@ test('recovery after a crash is exact and the run finishes on the reference fing
   await drive(second, workloads, 137, 300);
   for (const seed of seeds) {
     const attestation = await second.complete(`s${seed}`, AT);
-    const reference = runChaosLoadTest({ secret: SECRET, seed, completedAt: AT });
-    assert.equal(attestation.signature, reference.attestation.signature, `seed ${seed}`);
+    const reference = referenceFingerprint(`s${seed}`, { secret: SECRET, seed, completedAt: AT });
+    assert.equal(attestation.signature, reference, `seed ${seed}`);
   }
   await second.close();
 });

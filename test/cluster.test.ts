@@ -6,22 +6,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { defaultConfig, defaultShardConfig } from '../src/config.ts';
-import { runChaosLoadTest } from '../src/chaosLoadTest.ts';
 import { ShardCluster, exitAction, type ClusterOptions } from '../src/cluster/cluster.ts';
 import { ClusterError } from '../src/cluster/errors.ts';
 import { shardFor } from '../src/cluster/placement.ts';
 import { segmentName } from '../src/cluster/wal.ts';
-import { ScenarioDriver, referenceEngine, type DriverSession } from '../src/cluster/workload.ts';
+import {
+  ScenarioDriver,
+  referenceEngine,
+  referenceFingerprint,
+  type DriverSession,
+} from '../src/cluster/workload.ts';
 
 const SECRET = 'sim-001-dev-secret';
 const AT = '2026-01-01T00:00:00.000Z';
 
-const referenceSignatures = new Map<number, string>();
-function referenceSignature(seed: number): string {
-  let signature = referenceSignatures.get(seed);
+const referenceSignatures = new Map<string, string>();
+function referenceSignature({ id, seed }: DriverSession): string {
+  const key = `${id} ${seed}`;
+  let signature = referenceSignatures.get(key);
   if (signature === undefined) {
-    signature = runChaosLoadTest({ secret: SECRET, seed, completedAt: AT }).attestation.signature;
-    referenceSignatures.set(seed, signature);
+    signature = referenceFingerprint(id, { secret: SECRET, seed, completedAt: AT });
+    referenceSignatures.set(key, signature);
   }
   return signature;
 }
@@ -83,8 +88,8 @@ async function runToEnd(driver: ScenarioDriver): Promise<void> {
 }
 
 function assertReferenceFingerprints(driver: ScenarioDriver, sessions: DriverSession[]): void {
-  for (const { id, seed } of sessions) {
-    assert.equal(driver.attestations.get(id)?.signature, referenceSignature(seed), id);
+  for (const session of sessions) {
+    assert.equal(driver.attestations.get(session.id)?.signature, referenceSignature(session), session.id);
   }
 }
 
@@ -325,9 +330,12 @@ describe('a running cluster', { concurrency: true }, () => {
       return true;
     });
 
+    // Version 1 is the build that signed attestations without the session id.
+    // Replaying its logs here would sign their completions as v2, unlike the
+    // attestations it already issued for them.
     const manifest = JSON.parse(await readFile(join(dir, 'cluster.json'), 'utf8')) as Record<string, unknown>;
-    await writeFile(join(dir, 'cluster.json'), JSON.stringify({ ...manifest, version: 2 }));
-    await assert.rejects(start({ shards: 2 }), { code: 'MANIFEST_MISMATCH', message: /version 2/ });
+    await writeFile(join(dir, 'cluster.json'), JSON.stringify({ ...manifest, version: 1 }));
+    await assert.rejects(start({ shards: 2 }), { code: 'MANIFEST_MISMATCH', message: /version 1/ });
   });
 
   test('the realtime clock ticks on its own and reports health', async (t) => {

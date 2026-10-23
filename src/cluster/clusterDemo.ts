@@ -147,7 +147,9 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
     clearInterval(feeder);
 
     const attestations = await Promise.all(ids.map((id) => cluster.complete(id)));
-    const verified = attestations.filter((attestation) => verify(attestation, options.secret)).length;
+    const verified = attestations.filter((attestation, i) =>
+      verify(attestation, options.secret, { sessionId: ids[i]! }),
+    ).length;
     const signed = attestations.map((attestation) => attestation.payload.directorEvents.length);
     const mostSigned = Math.max(0, ...signed);
     const mostDistinct = Math.max(0, ...distinctAlerts.values());
@@ -155,7 +157,7 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
 
     const checks: ClusterDemoResult['checks'] = [
       {
-        label: 'Every session completed with an attestation that verifies',
+        label: 'Every session completed with an attestation that verifies as its own',
         ok: verified === ids.length,
         detail: `${verified}/${ids.length}`,
       },

@@ -8,6 +8,12 @@ export interface SimulationOptions {
   config?: EngineConfig;
   /** Resume from a frozen engine instead of the spec's initial world (crash recovery). */
   snapshot?: EngineSnapshot;
+  /**
+   * The session this simulation runs as, in a system that runs many. Given,
+   * the attestation is schema v2 and signs it. A standalone run leaves it out
+   * and signs v1, so the single session fingerprint stays where it is.
+   */
+  sessionId?: string;
 }
 
 /**
@@ -20,10 +26,12 @@ export class Simulation {
   readonly engine: SimulationEngine;
 
   private readonly secret: string;
+  private readonly sessionId: string | undefined;
   private completed = false;
 
   constructor(options: SimulationOptions) {
     this.secret = options.secret;
+    this.sessionId = options.sessionId;
     const config = options.config ?? defaultConfig;
     this.engine = options.snapshot
       ? SimulationEngine.restore(options.snapshot, config)
@@ -42,9 +50,10 @@ export class Simulation {
   }
 
   /**
-   * Freeze the final state, attach a timestamp, and sign it. `completedAt` can
-   * be injected so a reproducible run yields a reproducible fingerprint; left
-   * out, it stamps the real completion time.
+   * Freeze the final state, attach a timestamp, and sign it, naming the
+   * session when there is one. `completedAt` can be injected so a
+   * reproducible run yields a reproducible fingerprint; left out, it stamps
+   * the real completion time.
    */
   complete(completedAt: string = new Date().toISOString()): Attestation {
     this.completed = true;
@@ -52,14 +61,17 @@ export class Simulation {
     const finalState: WorldState = { ...this.engine.state };
     Object.freeze(finalState);
 
-    const payload: AttestationPayload = {
-      schema: 'chaosim.sim001.attestation.v1',
+    const body = {
       finalState,
       tickCount: this.engine.tick,
       trapTripped: this.engine.isTrapTripped,
       directorEvents: this.engine.directorLog.map((event) => ({ ...event })),
       completedAt,
     };
+    const payload: AttestationPayload =
+      this.sessionId === undefined
+        ? { schema: 'chaosim.sim001.attestation.v1', ...body }
+        : { schema: 'chaosim.sim001.attestation.v2', sessionId: this.sessionId, ...body };
 
     return sign(payload, this.secret);
   }

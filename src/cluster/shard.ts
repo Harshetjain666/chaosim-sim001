@@ -388,7 +388,8 @@ export class Shard {
     if (this.sessions.has(id) || this.completed.has(id) || this.forgotten.has(id)) {
       throw new CorruptionError(`session ${id} opened twice`);
     }
-    this.sessions.set(id, this.newSession(new Simulation({ secret: this.secret, config: this.engineConfig })));
+    const sim = new Simulation({ secret: this.secret, config: this.engineConfig, sessionId: id });
+    this.sessions.set(id, this.newSession(sim));
   }
 
   private applyTick(tick: number, inputs: readonly TickInput[]): PublishedEvent[] {
@@ -448,7 +449,7 @@ export class Shard {
     this.shardTick = checkpoint.tick;
     this.checkpointStats.lastSeq = checkpoint.seq;
     for (const { id, engine } of checkpoint.sessions) {
-      const sim = new Simulation({ secret: this.secret, config: this.engineConfig, snapshot: engine });
+      const sim = new Simulation({ secret: this.secret, config: this.engineConfig, snapshot: engine, sessionId: id });
       this.sessions.set(id, this.newSession(sim));
     }
     for (const { id, attestation } of checkpoint.completed) this.completed.set(id, attestation);
