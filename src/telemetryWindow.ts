@@ -50,4 +50,14 @@ export class TelemetryWindow {
   size(): number {
     return this.events.length;
   }
+
+  /** Copy of the buffered events, oldest first, for engine snapshots. */
+  toArray(): TelemetryEvent[] {
+    return this.events.map((event) => ({ t: event.t, kind: event.kind }));
+  }
+
+  /** Replace the contents with a snapshot's events (oldest first). */
+  load(events: readonly TelemetryEvent[]): void {
+    this.events = events.map((event) => ({ t: event.t, kind: event.kind }));
+  }
 }

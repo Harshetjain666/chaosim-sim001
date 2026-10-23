@@ -62,6 +62,8 @@ Why this prevents the two failure modes in the question:
 
 At 10,000 sessions you shard. One worker thread cannot and should not own all of them. Partition by `sessionId` (a stable hash) across `worker_threads`, each worker running its own accumulator loop over its slice, with sticky routing so a connection always lands on the worker that owns its state. Sessions are independent, so the shards never coordinate on the hot path. You scale by adding workers, then processes, then nodes. Event loop lag (measured with `monitorEventLoopDelay`) is the health signal: if a shard's lag climbs, it is over its budget and sessions migrate.
 
+This part is built. [src/cluster/](../src/cluster/) places sessions on `worker_threads` shards by rendezvous hashing, runs each shard on the same accumulator clock as the live loop, and reports per shard event loop lag and tick time. Migration is the one piece not built yet. [docs/SCALE_OUT.md](SCALE_OUT.md) has the design and the measured numbers.
+
 ### 1.2 ECS state architecture vs database bottlenecks
 
 The volatile state lives entirely in memory in a structure of arrays layout, which is the practical core of an ECS approach. Instead of 10,000 heap objects (which fragment memory and punish the garbage collector), each metric is one contiguous typed array indexed by a dense session slot, with a map from `sessionId` to slot:
@@ -80,14 +82,14 @@ The tick then walks these arrays in order, which is cache friendly, allocation f
 Nothing on this path touches a database. Writing per tick to a persistent store is what chokes connections, so we never do it. Persistence happens through a deterministic, time windowed batch flush plus a write ahead log, which together give crash safety:
 
 * **Checkpoint flush.** Every N ticks (for example every 5 seconds) a flush job snapshots the dirty session slots and writes one compact batch to the persistent layer. To avoid blocking the loop, it snapshots under a copy on write or double buffer scheme: the loop keeps mutating the live arrays while the flusher serializes the frozen copy.
-* **Write ahead log.** Between checkpoints, each tick appends its state deltas (or the raw telemetry frame) to an append only segment that is `fsync`ed in small batches. This is ordinary file I/O on a local volume, replicated, not a managed service.
+* **Write ahead log.** Between checkpoints, each tick appends its raw telemetry frame to an append only segment that is `fsync`ed in small batches. It has to be the input frame and not the resulting state deltas: the sliding window and the director's latch are state too, and only replaying inputs through the deterministic step rebuilds them exactly. This is ordinary file I/O on a local volume, replicated, not a managed service.
 
 Now the crash question. If a container self destructs mid run, on restart the worker replays from the last checkpoint and then replays the WAL segment forward to reconstruct the exact in memory state. Each record carries a monotonic tick sequence number, so replay is idempotent: anything already folded into the checkpoint is skipped. The data loss window (the RPO) is bounded by the WAL `fsync` interval, which is sub second, not by the much larger checkpoint interval. You lose at most the last unsynced batch, and because replay is deterministic (Challenge 1.1), the reconstructed state is bit for bit identical to what was lost up to that boundary.
 
 ```ts
 function flushCheckpoint(shard: Shard, tick: number) {
-  const frozen = shard.snapshotDirtyColumns();   // copy-on-write, non-blocking
-  queueMicrotask(() => persist.writeBatch(tick, frozen));
+  const frozen = shard.snapshotDirtyColumns();   // copy-on-write: the only synchronous part
+  void persist.writeBatch(tick, frozen);         // async fs, runs on the libuv thread pool
 }
 
 // On boot:
@@ -100,7 +102,9 @@ function recover(shard: Shard) {
 }
 ```
 
-The prototype's analog of this is small but real: [src/telemetryWindow.ts](../src/telemetryWindow.ts) is the in memory buffer that is summarized rather than persisted per event, and [src/attestation.ts](../src/attestation.ts) is the final durable checkpoint. Production adds the WAL and the periodic checkpoints between.
+The prototype's analog of this is small but real: [src/telemetryWindow.ts](../src/telemetryWindow.ts) is the in memory buffer that is summarized rather than persisted per event, and [src/attestation.ts](../src/attestation.ts) is the final durable checkpoint. Production adds the WAL and the periodic checkpoints between, and that is now built in [src/cluster/](../src/cluster/): a per shard log with group commit, atomic checkpoints every 50 ticks, and recovery that replays through the same `step()`.
+
+Building it surfaced two things this section originally missed. A write handed to `queueMicrotask` does not leave the loop at all, since a microtask runs on the same thread before the next timer; the write has to go through the async file API. And an outbound effect such as the CEO alert must wait until the tick that produced it is durable. Otherwise a crash rolls the world back to before the trap, the trap is armed again, and the candidate can see the alert twice. [docs/SCALE_OUT.md](SCALE_OUT.md) covers both, and a crash drill that kills a cluster process with SIGKILL checks that recovery is bit identical.
 
 ### 1.3 Offline state simulation
 
@@ -267,12 +271,12 @@ The prototype in this repository implements the full SIM-001 specification: the 
 
 The prototype is one session in one process. Scaling it is mostly about replicating the spine safely, and the determinism is what makes that safe, because sessions are independent and shards are replayable.
 
-* **Sharding.** Partition sessions by a stable hash of `sessionId` across worker threads, then across processes, then across nodes. Each shard runs its own fixed timestep loop over its slice. Sticky WebSocket routing keeps a connection on the worker that owns its state. No cross shard coordination exists on the hot path.
+* **Sharding.** Partition sessions by a stable hash of `sessionId` across worker threads, then across processes, then across nodes. Each shard runs its own fixed timestep loop over its slice. Sticky WebSocket routing keeps a connection on the worker that owns its state. No cross shard coordination exists on the hot path. Built for worker threads in [src/cluster/](../src/cluster/).
 * **State layout.** Flip the per session object into the structure of arrays component store from Challenge 1.2. Bounded ring buffers for raw events, incremental aggregates for metrics, contiguous typed arrays for the authoritative columns.
-* **Durability.** Per shard write ahead log plus periodic checkpoints, with idempotent replay on restart and a sub second RPO, as in Challenge 1.2. A container that dies comes back bit identical up to the last synced batch.
+* **Durability.** Per shard write ahead log plus periodic checkpoints, with idempotent replay on restart and a sub second RPO, as in Challenge 1.2. A container that dies comes back bit identical up to the last synced batch. Built, and checked by a SIGKILL crash drill (`node src/index.ts --crash-drill`).
 * **Telemetry and attestation pipeline.** Columnar binary frames, delta plus streaming compression, a hash chain for tamper evidence, and asymmetric signing into the immutable lake, all running on worker threads off the loop, as in Challenge 1.4.
 * **Offline lifecycle.** The closed form plus coarse replay catch up from Challenge 1.3 runs at re-authentication inside the 500ms budget.
 * **Backpressure everywhere.** Bounded queues, coalescing, and load shedding with counters at every boundary, ingestion, scoring handoff, and serialization, with event loop lag as the SLO that triggers session migration.
 * **The scorer off the loop.** `ai-scorer.ts`, the Claude evaluation engine, consumes summarized flushes triggered by the boundaries in Challenge 2.3. The Failure Cascade is a natural evaluation unit because the director already marks that boundary.
 
-The throughput argument is straightforward. A single worker comfortably runs a few thousand 100ms ticks per second of bounded work, so a few hundred to a thousand sessions per shard is conservative, and you scale shards linearly. The reason linear scaling is actually achievable here, and not just hoped for, is the same property the prototype is built around: each session is an independent, deterministic, replayable function of its own inputs. That is the whole design, and everything else is an optimization of it.
+The throughput argument is straightforward, and it is now measured rather than estimated. On the built cluster a shard carried 10,000 sessions through the full failure cascade using at most 17 percent of one core, so the estimate this paragraph used to make, a few hundred to a thousand sessions per shard, was conservative by an order of magnitude. CPU is not the first wall, though. The checkpoint freeze is: turning 10,000 readable session objects into a checkpoint stops that shard's loop for about 74ms every five seconds, and the cost grows linearly with sessions. That is the concrete case for the structure of arrays layout in Challenge 1.2, where the freeze becomes a column copy. You scale shards linearly. The reason linear scaling is actually achievable here, and not just hoped for, is the same property the prototype is built around: each session is an independent, deterministic, replayable function of its own inputs. That is the whole design, and everything else is an optimization of it.

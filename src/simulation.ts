@@ -1,11 +1,13 @@
 import { defaultConfig, type EngineConfig } from './config.ts';
-import { SimulationEngine, type TickResult } from './engine.ts';
+import { SimulationEngine, type EngineSnapshot, type TickResult } from './engine.ts';
 import { sign, type Attestation, type AttestationPayload } from './attestation.ts';
 import type { TelemetryEvent, WorldState } from './types.ts';
 
 export interface SimulationOptions {
   secret: string;
   config?: EngineConfig;
+  /** Resume from a frozen engine instead of the spec's initial world (crash recovery). */
+  snapshot?: EngineSnapshot;
 }
 
 /**
@@ -22,7 +24,10 @@ export class Simulation {
 
   constructor(options: SimulationOptions) {
     this.secret = options.secret;
-    this.engine = new SimulationEngine(options.config ?? defaultConfig);
+    const config = options.config ?? defaultConfig;
+    this.engine = options.snapshot
+      ? SimulationEngine.restore(options.snapshot, config)
+      : new SimulationEngine(config);
   }
 
   step(batch: readonly TelemetryEvent[] = []): TickResult {

@@ -16,6 +16,23 @@ export interface TickResult {
 }
 
 /**
+ * Everything that decides the engine's future, frozen at a tick boundary.
+ *
+ * WorldState alone is not enough: the sliding window decides the next tick's
+ * velocity and backspace count, and the director's latch decides whether the
+ * trap can fire again. A snapshot carries all of it, so an engine restored
+ * from one continues exactly as the original would have. It is plain data so
+ * it can cross a thread boundary or go to disk as JSON.
+ */
+export interface EngineSnapshot {
+  tick: number;
+  state: WorldState;
+  window: TelemetryEvent[];
+  trapTripped: boolean;
+  directorLog: DirectorEvent[];
+}
+
+/**
  * The authoritative tick engine.
  *
  * One method matters: `step`. It is a pure function of (current state, this
@@ -51,6 +68,28 @@ export class SimulationEngine {
 
   get isTrapTripped(): boolean {
     return this.director.isTrapTripped;
+  }
+
+  /** Freeze the engine between ticks. The result shares nothing with the live engine. */
+  snapshot(): EngineSnapshot {
+    return {
+      tick: this.tickCount,
+      state: { ...this.state },
+      window: this.window.toArray(),
+      trapTripped: this.director.isTrapTripped,
+      directorLog: this.directorLog.map((event) => ({ ...event })),
+    };
+  }
+
+  /** Rebuild an engine that continues exactly where the snapshot left off. */
+  static restore(snapshot: EngineSnapshot, config: EngineConfig = defaultConfig): SimulationEngine {
+    const engine = new SimulationEngine(config);
+    engine.tickCount = snapshot.tick;
+    Object.assign(engine.state, snapshot.state);
+    engine.window.load(snapshot.window);
+    engine.director.isTrapTripped = snapshot.trapTripped;
+    engine.directorLog.push(...snapshot.directorLog.map((event) => ({ ...event })));
+    return engine;
   }
 
   /** Advance exactly one fixed-size tick. */

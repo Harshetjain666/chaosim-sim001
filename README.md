@@ -18,6 +18,8 @@ On Node 22.6 through 23.5, add the `--experimental-strip-types` flag, or run any
 node src/index.ts        # run the deterministic chaos load test and print the report
 node src/index.ts --trace  # same, with a per second metrics table
 node src/index.ts --live   # drive the engine in real time for ~30 seconds
+node src/index.ts --cluster      # thousands of sessions on worker shards in real time, one shard killed mid run
+node src/index.ts --crash-drill  # SIGKILL a sharded cluster twice and prove recovery is exact
 node --test                # run the unit suite
 ```
 
@@ -29,27 +31,57 @@ The default command runs the three phase Chaos Load Test, prints a phase by phas
 * **Phase 2 (10s to 20s).** Friction ramps in. Velocity climbs first, then backspacing spikes. Panic begins rising but stays under the trap threshold of 75.
 * **Phase 3 (20s to 30s).** The failure cascade sustains the pressure, panic crosses 75, the Scenario Director fires exactly once: codebase health drops by 30, CEO anxiety jumps to 95, and the alert is emitted. On completion the final state is frozen, timestamped, and signed.
 
+## Scale out
+
+The engine also runs sharded. `src/cluster/` puts sessions on worker thread shards, each with its own fixed timestep loop, a write ahead log, and checkpoints every five seconds, so a shard that crashes comes back with exactly the state it lost. [docs/SCALE_OUT.md](docs/SCALE_OUT.md) is the design, the guarantees, and the measured numbers.
+
+* `--cluster` runs it in real time. By default that is 4,000 sessions on 4 shards for 30 seconds, every session fed the chaos scenario, with shard 0 killed at 21 seconds, right as the traps start to trip. It prints shard health every second, then checks that every attestation verifies, that the trap fired at most once per session, and that every alert reached the consumer once after dedup. `--shards=N`, `--sessions=N`, `--seconds=N` and `--kill-at=S` change the run, and `--kill-at=0` leaves every shard alive.
+* `--crash-drill` kills a cluster process with SIGKILL twice, once while it is writing and once at a known point, then recovers it in a fresh process. It checks that no acknowledged tick was lost, that every recovered session is bit identical to the engine that never crashed, and that every session still finishes on its reference fingerprint.
+
 ## Project layout
 
 ```
 src/
   types.ts             WorldState and telemetry types
-  config.ts            engine tunables in one place
+  config.ts            engine and shard tunables in one place
   worldState.ts        authoritative state factory (spec initial values)
   telemetryWindow.ts   per session sliding window over raw events
   stressModel.ts       metric summarization and the panic stress curve
   scenarioDirector.ts  the trap: fires once, mutates the world, emits the alert
-  engine.ts            the authoritative fixed tick engine (pure step function)
+  engine.ts            the authoritative fixed tick engine (pure step function, snapshot and restore)
   attestation.ts       canonical serialize, HMAC-SHA256 sign, constant time verify
   simulation.ts        lifecycle façade: step then complete()
-  liveLoop.ts          fixed timestep real time driver (no clock drift)
+  liveLoop.ts          fixed timestep clock (no clock drift), shared by the live run and every shard
   scenario.ts          synthetic telemetry generator for the load test
   chaosLoadTest.ts     the three phase scenario plus acceptance checks
   index.ts             CLI entry and report formatting
+  cluster/
+    cluster.ts         the router: placement, batching, requests, supervision and restart
+    lock.ts            one process per data directory
+    placement.ts       rendezvous hashing: which shard owns a session
+    protocol.ts        messages between the router and a shard worker
+    shardWorker.ts     worker thread entry: one shard, its clock, its health metrics
+    shard.ts           sessions, ticks, output commit, checkpoints, recovery
+    inbox.ts           per session coalescing inbox (counts, not events)
+    wal.ts             write ahead log: segments, group commit, torn tail scan
+    checkpoint.ts      atomic checkpoints
+    frame.ts           length and crc32 framing, fsync helpers
+    errors.ts          corruption and cluster errors
+    workload.ts        scenario workloads, the reference engine, the lockstep driver
+    crashDrill.ts      the SIGKILL drill
+    crashDrillChild.ts the process the drill kills
+    clusterDemo.ts     the real time demo
 test/
   sim.test.ts          determinism, trap once, stress curve, attestation
+  snapshot.test.ts     freezing and resuming the engine
+  wal.test.ts          log format, group commit, torn and corrupt logs
+  shard.test.ts        recovery, output commit, checkpoints, idempotent completion
+  cluster.test.ts      placement, sharded runs, shard kill, restart, manifest, crash loops
+  crashDrill.test.ts   the SIGKILL drill
+  clusterDemo.test.ts  real time smoke test
 docs/
   ARCHITECTURE_BRIEF.md  Challenge 1 and 2 answers, design notes, production path
+  SCALE_OUT.md           sharding, the write ahead log, recovery, and what each failure costs
 ```
 
 ## Design in one paragraph
@@ -59,3 +91,5 @@ The whole engine reduces to one idea: the world only ever changes inside `Simula
 ## Configuration
 
 `CHAOSIM_SECRET` sets the HMAC key (defaults to a development key). Pass `--seed=N` to vary the synthetic telemetry while keeping the run reproducible. Pass `--fixed-time` to stamp a constant completion time so the fingerprint itself is reproducible across runs.
+
+The crash drill takes `--shards=N`, `--sessions=N`, and `--kill-after=T` to pin the first kill to tick T instead of a random one. A cluster's data directory remembers its shard count, engine config and signing secret (as a keyed fingerprint) and refuses to start with different ones, because placement, replay and already issued attestations depend on them. Only one process can use a data directory at a time. Shard tunables (checkpoint interval, inbox cap, retained completions) live next to the engine's in `src/config.ts` and are free to change between runs.

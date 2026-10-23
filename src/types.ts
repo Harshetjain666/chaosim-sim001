@@ -6,12 +6,14 @@
  * never by the client.
  */
 
-export type TelemetryKind =
-  | 'keystroke'
-  | 'backspace'
-  | 'shell'
-  | 'fileSave'
-  | 'windowBlur';
+/**
+ * Every kind of event the IDE can send. The order is load-bearing: a kind's
+ * index is its compact code on the wire and in the write ahead log, and it is
+ * the canonical order a shard rebuilds a tick's batch in.
+ */
+export const TELEMETRY_KINDS = ['keystroke', 'backspace', 'shell', 'fileSave', 'windowBlur'] as const;
+
+export type TelemetryKind = (typeof TELEMETRY_KINDS)[number];
 
 export interface TelemetryEvent {
   /** Monotonic simulation timestamp in milliseconds since session start. */

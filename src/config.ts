@@ -26,6 +26,36 @@ export interface EngineConfig {
   ceoAnxietyOnTrap: number;
 }
 
+/**
+ * Shard tunables. Unlike EngineConfig these never change what a session
+ * computes, only how a shard runs it, so they may differ from one run of a
+ * data directory to the next.
+ */
+export interface ShardConfig {
+  /** Shard ticks between checkpoints. 50 ticks is five seconds at 100ms. */
+  checkpointEveryTicks: number;
+  /** Most events of one kind a session can land in one tick; the excess is dropped and counted. */
+  inboxCapPerKind: number;
+  /** Completed attestations a shard remembers, so a retried completion gets the same answer. */
+  completedRetention: number;
+  /**
+   * Completed session ids remembered after their attestation is dropped, so
+   * a reused id is refused instead of quietly starting a second session.
+   * Ids are cheap, so this is far larger than completedRetention.
+   */
+  completedIdRetention: number;
+  /** Most ticks a shard runs back to back while catching up after a stall. */
+  maxCatchUpTicks: number;
+}
+
+export const defaultShardConfig: ShardConfig = {
+  checkpointEveryTicks: 50,
+  inboxCapPerKind: 255,
+  completedRetention: 1000,
+  completedIdRetention: 10_000,
+  maxCatchUpTicks: 10,
+};
+
 export const defaultConfig: EngineConfig = {
   tickMs: 100,
   windowMs: 2000,
