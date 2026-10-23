@@ -103,8 +103,12 @@ export class SessionTable {
   private numbers: Record<NumberColumn, Float64Array>;
   /** Per tick kind counts, by slot; within a slot, by tick % windowTicks. */
   private window: Uint16Array;
-  /** Each session's window summed per kind, kept as ticks enter and leave it. */
-  private windowTotals: Uint32Array;
+  /**
+   * Each session's window summed per kind, kept as ticks enter and leave it.
+   * Float64 holds every whole number a window can reach exactly: 32 bits
+   * would wrap once the cap times the window's ticks passed 2^32.
+   */
+  private windowTotals: Float64Array;
   /** Telemetry counted since the last tick, by slot and kind. */
   private inbox: Uint16Array;
   private inboxUsed: Uint8Array;
@@ -122,7 +126,7 @@ export class SessionTable {
     this.capacity = Math.max(1, capacity);
     this.numbers = numberColumns(() => new Float64Array(this.capacity));
     this.window = new Uint16Array(this.capacity * this.ringLength);
-    this.windowTotals = new Uint32Array(this.capacity * KIND_COUNT);
+    this.windowTotals = new Float64Array(this.capacity * KIND_COUNT);
     this.inbox = new Uint16Array(this.capacity * KIND_COUNT);
     this.inboxUsed = new Uint8Array(this.capacity);
     this.landed = new Float64Array(this.capacity);
@@ -211,10 +215,16 @@ export class SessionTable {
    * changes nothing. Returns the director events, in slot order.
    */
   step(inputs: readonly TickInput[]): SessionEvent[] {
+    // A replayed record is checksummed JSON, so its shape is checked, not assumed.
+    if (!Array.isArray(inputs)) throw new CorruptionError('a tick record carries inputs that are not a list');
     this.steps += 1;
     const slots = new Int32Array(inputs.length);
     for (let i = 0; i < inputs.length; i += 1) {
-      const [id, counts] = inputs[i]!;
+      const input: unknown = inputs[i];
+      if (!Array.isArray(input) || input.length !== 2 || typeof input[0] !== 'string') {
+        throw new CorruptionError(`a tick record carries a malformed input: ${JSON.stringify(input)}`);
+      }
+      const [id, counts] = input as TickInput;
       const slot = this.slotOf.get(id);
       if (slot === undefined || this.landed[slot] === this.steps) {
         throw new CorruptionError(`a tick record carries input for unknown or repeated session ${id}`);
@@ -409,7 +419,7 @@ function numberColumns<T>(make: (name: NumberColumn) => T): Record<NumberColumn,
   return Object.fromEntries(NUMBER_COLUMNS.map((name) => [name, make(name)])) as Record<NumberColumn, T>;
 }
 
-function resized<T extends Float64Array | Uint32Array | Uint16Array | Uint8Array>(column: T, length: number): T {
+function resized<T extends Float64Array | Uint16Array | Uint8Array>(column: T, length: number): T {
   const next = new (column.constructor as new (length: number) => T)(length);
   next.set(column);
   return next;

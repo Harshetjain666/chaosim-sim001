@@ -14,8 +14,12 @@ import { UnsupportedFormatError } from './errors.ts';
  */
 export const FRAME_HEADER_BYTES = 8;
 
-/** Far larger than any record a shard writes. A length beyond it is damage. */
-const MAX_PAYLOAD_BYTES = 256 * 1024 * 1024;
+/**
+ * The largest payload a frame carries. A reader takes a longer length for
+ * damage, so a writer refuses to produce one rather than write a file that
+ * cannot be read back.
+ */
+export const MAX_PAYLOAD_BYTES = 256 * 1024 * 1024;
 
 export function encodeFrame(payload: Buffer): Buffer {
   const frame = Buffer.allocUnsafe(FRAME_HEADER_BYTES + payload.length);
@@ -31,6 +35,10 @@ export function encodeFrame(payload: Buffer): Buffer {
  */
 export function sealFrame(buf: Buffer, start: number): void {
   const payload = buf.subarray(start + FRAME_HEADER_BYTES);
+  // readFrame reports an empty or oversized frame as torn, so never write one.
+  if (payload.length === 0 || payload.length > MAX_PAYLOAD_BYTES) {
+    throw new RangeError(`a frame holds 1 to ${MAX_PAYLOAD_BYTES} bytes, not ${payload.length}`);
+  }
   buf.writeUInt32LE(payload.length, start);
   buf.writeUInt32LE(crc32(payload), start + 4);
 }

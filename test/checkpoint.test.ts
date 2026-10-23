@@ -14,8 +14,9 @@ import {
   type ShardCheckpoint,
 } from '../src/cluster/checkpoint.ts';
 import { CorruptionError, UnsupportedFormatError } from '../src/cluster/errors.ts';
-import { encodeFrame } from '../src/cluster/frame.ts';
-import { SessionTable } from '../src/cluster/sessionTable.ts';
+import { MAX_PAYLOAD_BYTES, encodeFrame } from '../src/cluster/frame.ts';
+import { NUMBER_COLUMNS, SessionTable, type SessionColumns } from '../src/cluster/sessionTable.ts';
+import { TELEMETRY_KINDS } from '../src/types.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
 const CAP = defaultShardConfig.inboxCapPerKind;
@@ -94,6 +95,19 @@ test('a checkpoint whose columns do not match its header is corrupt', async (t) 
   // Intact framing around a payload one count short: a bug, not a torn write.
   await writeFile(join(dir, checkpointName(77)), reframe(bytes, bytes.subarray(PAYLOAD_START, bytes.length - 2)));
   await assert.rejects(loadCheckpoint(dir), CorruptionError);
+});
+
+test('a checkpoint too big for one frame is refused instead of written', () => {
+  // The reader takes an oversized frame for a torn one, and the shard prunes
+  // the log behind every checkpoint it writes, so writing it would lose data.
+  const windowTicks = Math.ceil(MAX_PAYLOAD_BYTES / (2 * TELEMETRY_KINDS.length)) + 1;
+  const sessions = { ids: ['long'], windowTicks, window: new Uint16Array(windowTicks * TELEMETRY_KINDS.length) } as SessionColumns;
+  for (const column of NUMBER_COLUMNS) sessions[column] = new Float64Array(1);
+  assert.throws(
+    () => encodeCheckpoint({ version: 2, shardId: 0, seq: 1, tick: 1, sessions, completed: [], forgotten: [] }),
+    RangeError,
+  );
+  assert.throws(() => encodeFrame(Buffer.alloc(0)), RangeError, 'an empty frame reads as torn too');
 });
 
 test('a checkpoint from the previous format is unsupported, not corrupt', async (t) => {

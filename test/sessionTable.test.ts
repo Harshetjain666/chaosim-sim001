@@ -6,6 +6,7 @@ import { SimulationEngine, type EngineSnapshot } from '../src/engine.ts';
 import { mulberry32 } from '../src/rng.ts';
 import type { DirectorEvent } from '../src/scenarioDirector.ts';
 import { Simulation, attestCompletion } from '../src/simulation.ts';
+import { keystrokeVelocity } from '../src/stressModel.ts';
 import { TELEMETRY_KINDS } from '../src/types.ts';
 import { CorruptionError } from '../src/cluster/errors.ts';
 import { expandBatch, kindCode } from '../src/cluster/inbox.ts';
@@ -146,6 +147,8 @@ test('a session moved into a freed slot keeps its state and its pending telemetr
 
   table.open('d'); // reuses the slot c left behind, which must start clean
   assert.deepEqual(snapshotOf(table, 'd'), new SimulationEngine(defaultConfig).snapshot());
+  table.ingest('d', kindCode('keystroke'), 1);
+  assert.deepEqual(table.drain(), [['d', [1, 0, 0, 0, 0]]], 'd inherits none of the counts c left in that slot');
 });
 
 test('a tick that does not fit the sessions is refused before anything changes', () => {
@@ -162,6 +165,9 @@ test('a tick that does not fit the sessions is refused before anything changes',
     ['a negative count', [['a', [1, -1, 0, 0, 0]]]],
     ['a fractional count', [['a', [1, 0.5, 0, 0, 0]]]],
     ['a count the columns cannot hold', [['a', [MAX_TICK_COUNT + 1, 0, 0, 0, 0]]]],
+    ['inputs that are not a list', {} as unknown as TickInput[]],
+    ['an input that is not a pair', [5 as unknown as TickInput]],
+    ['an input whose id is not a string', [[7, [1, 0, 0, 0, 0]] as unknown as TickInput]],
   ];
   for (const [what, inputs] of refused) {
     assert.throws(() => table.step(inputs), CorruptionError, what);
@@ -199,6 +205,24 @@ test('columns loaded into a new table carry on exactly where they left off', () 
   }
   for (const id of live) assert.deepEqual(snapshotOf(restored, id), snapshotOf(table, id), id);
   assert.deepEqual(restored.columns(), table.columns());
+  restored.ingest('a', kindCode('keystroke'), 1);
+  assert.deepEqual(restored.drain(), [['a', [1, 0, 0, 0, 0]]], 'a inherits none of the counts used left in its slot');
+});
+
+test('a window full of capped ticks totals exactly, past what 32 bits can count', () => {
+  // 65,535 events a tick across a 65,538 tick window passes 2^32.
+  const config = { ...defaultConfig, tickMs: 1, windowMs: 65_538 };
+  const table = new SessionTable(config, MAX_TICK_COUNT, 1);
+  table.open('flood');
+  const counts = [MAX_TICK_COUNT, MAX_TICK_COUNT, 0, 0, 0];
+  for (let tick = 0; tick < table.windowTicks; tick += 1) table.step([['flood', counts]]);
+  const full = MAX_TICK_COUNT * table.windowTicks;
+  assert.ok(full > 2 ** 32);
+  assert.equal(table.summary('flood')?.state.backspaceCount, full);
+  assert.equal(table.summary('flood')?.state.keystrokeVelocity, keystrokeVelocity(full, config));
+
+  table.step([]); // the oldest tick leaves the window
+  assert.equal(table.summary('flood')?.state.backspaceCount, full - MAX_TICK_COUNT);
 });
 
 test('columns from a different window length are refused', () => {

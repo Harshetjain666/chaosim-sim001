@@ -449,7 +449,15 @@ export class Shard {
     }
     const started = performance.now();
     const seq = this.wal.lastSeq;
-    const bytes = encodeCheckpoint(this.freeze(seq));
+    let bytes: Buffer;
+    try {
+      bytes = encodeCheckpoint(this.freeze(seq));
+    } catch (error) {
+      // Nothing is rotated or pruned for a checkpoint that cannot be
+      // written, so the log still holds everything recovery needs.
+      this.fail(error);
+      return;
+    }
     this.wal.rotate();
     const frozenMs = performance.now() - started;
 

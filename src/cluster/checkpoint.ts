@@ -4,7 +4,15 @@ import { join } from 'node:path';
 import type { Attestation } from '../attestation.ts';
 import { TELEMETRY_KINDS } from '../types.ts';
 import { CorruptionError, UnsupportedFormatError } from './errors.ts';
-import { FRAME_HEADER_BYTES, assertKnownFormat, fsyncDir, readFrame, sealFrame, writeFully } from './frame.ts';
+import {
+  FRAME_HEADER_BYTES,
+  MAX_PAYLOAD_BYTES,
+  assertKnownFormat,
+  fsyncDir,
+  readFrame,
+  sealFrame,
+  writeFully,
+} from './frame.ts';
 import { NUMBER_COLUMNS, type SessionColumns } from './sessionTable.ts';
 
 /**
@@ -87,9 +95,16 @@ export function encodeCheckpoint(checkpoint: ShardCheckpoint): Buffer {
   const json = Buffer.from(JSON.stringify(header), 'utf8');
   const columns = [...NUMBER_COLUMNS.map((name) => sessions[name]), sessions.window];
   const columnBytes = columns.reduce((total, column) => total + column.byteLength, 0);
+  const payloadBytes = HEADER_LENGTH_BYTES + json.length + columnBytes;
+  if (payloadBytes > MAX_PAYLOAD_BYTES) {
+    throw new RangeError(
+      `a checkpoint of ${sessions.ids.length} sessions needs ${payloadBytes} bytes, more than a frame holds ` +
+        `(${MAX_PAYLOAD_BYTES}); run fewer sessions per shard or a shorter window`,
+    );
+  }
 
   const frameStart = CHECKPOINT_MAGIC.length;
-  const buf = Buffer.allocUnsafe(frameStart + FRAME_HEADER_BYTES + HEADER_LENGTH_BYTES + json.length + columnBytes);
+  const buf = Buffer.allocUnsafe(frameStart + FRAME_HEADER_BYTES + payloadBytes);
   CHECKPOINT_MAGIC.copy(buf, 0);
   let offset = buf.writeUInt32LE(json.length, frameStart + FRAME_HEADER_BYTES);
   offset += json.copy(buf, offset);
