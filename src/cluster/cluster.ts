@@ -120,6 +120,30 @@ export function exitAction(when: {
   return 'restart';
 }
 
+/** Options that say how the main entry point was given. Each takes a value: joined by =, or the next argument. */
+const ENTRY_POINT_OPTIONS = new Set(['--input-type', '-e', '--eval', '-p', '--print', '-pe']);
+
+/**
+ * The Node options a shard's worker starts with. Left undefined, a worker
+ * inherits the parent's, which is what a shard wants and the only way it can
+ * take V8 and per process options such as --max-old-space-size: a worker
+ * refuses those in an explicit list. But --input-type describes an -e or stdin
+ * entry point, and a worker that inherits it refuses to run its file. So only
+ * a parent started with it passes its options on explicitly, minus the ones
+ * that describe that entry point, the -e or -p script included.
+ */
+export function workerExecArgv(execArgv: readonly string[]): string[] | undefined {
+  const optionName = (arg: string) => arg.split('=', 1)[0]!;
+  if (!execArgv.some((arg) => optionName(arg) === '--input-type')) return undefined;
+  const kept: string[] = [];
+  for (let i = 0; i < execArgv.length; i += 1) {
+    const arg = execArgv[i]!;
+    if (!ENTRY_POINT_OPTIONS.has(optionName(arg))) kept.push(arg);
+    else if (!arg.includes('=')) i += 1; // its value is the next argument
+  }
+  return kept;
+}
+
 /**
  * The router: it places sessions on shards, batches their telemetry, carries
  * requests, and supervises the worker threads.
@@ -373,7 +397,10 @@ export class ShardCluster {
       shardConfig: this.shardConfig,
       clock: this.clock,
     };
-    const worker = new Worker(new URL('./shardWorker.ts', import.meta.url), { workerData });
+    const worker = new Worker(new URL('./shardWorker.ts', import.meta.url), {
+      workerData,
+      execArgv: workerExecArgv(process.execArgv),
+    });
     slot.worker = worker;
     slot.state = 'starting';
     slot.lastError = null;
