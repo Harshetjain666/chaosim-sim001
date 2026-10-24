@@ -12,6 +12,7 @@
     "chaos": "node src/index.ts",
     "live": "node src/index.ts --live",
     "cluster": "node src/index.ts --cluster",
+    "serve": "node src/index.ts --serve",
     "drill": "node src/index.ts --crash-drill",
     "test": "node --test"
   },

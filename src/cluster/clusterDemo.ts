@@ -6,6 +6,7 @@ import { verify } from '../attestation.ts';
 import { defaultConfig } from '../config.ts';
 import { TELEMETRY_KINDS } from '../types.ts';
 import { ShardCluster } from './cluster.ts';
+import type { ShardState } from './cluster.ts';
 import type { RecoveryReport } from './shard.ts';
 import { SCENARIO_TICKS, scenarioCounts } from './workload.ts';
 
@@ -17,6 +18,41 @@ export interface ClusterDemoOptions {
   /** Kill shard 0 this many seconds in. Leave it out to keep every shard alive. */
   killAtSecond?: number;
   log: (line: string) => void;
+  /** Called with everything the run reports, as structured data. The log lines stay as they are. */
+  onEvent?: (event: DemoEvent) => void;
+  /** Called once, when the sessions are open, with the handle for killing shards while the run is live. */
+  onControl?: (control: DemoControl) => void;
+  /** Aborting ends the run within a second and rejects with an AbortError. The cluster is still closed and its directory removed. */
+  signal?: AbortSignal;
+}
+
+/** One shard's second, as the dashboard and the health line show it. A shard that is down has no numbers. */
+export interface ShardLine {
+  shardId: number;
+  state: ShardState;
+  restarts: number;
+  ticksPerSec: number | null;
+  busyRatio: number | null;
+  lagP99Ms: number | null;
+  fsyncP99Ms: number | null;
+  walBytesPerSec: number | null;
+}
+
+export type DemoEvent =
+  | { type: 'started'; shards: number; sessions: number; seconds: number }
+  | { type: 'stats'; second: number; seconds: number; alerts: number; shards: ShardLine[] }
+  | { type: 'killed'; shardId: number; second: number }
+  | { type: 'recovered'; shardId: number; second: number; report: RecoveryReport }
+  | { type: 'kill-failed'; shardId: number; second: number; error: string };
+
+export interface DemoControl {
+  /**
+   * Fault injection while the run is live. Resolves once the shard is down and
+   * its supervisor is bringing it back, and rejects if it cannot be killed:
+   * it is not up, or the run is ending. When it is back a `recovered` event
+   * follows, and the final checks hold the run to it.
+   */
+  killShard(shardId: number): Promise<void>;
 }
 
 export interface ShardHealth {
@@ -50,13 +86,15 @@ export interface ClusterDemoResult {
  * it into a signed history reached the consumer, exactly once after dedup.
  */
 export async function runClusterDemo(options: ClusterDemoOptions): Promise<ClusterDemoResult> {
-  const { shards, seconds, log } = options;
+  const { shards, seconds, log, signal } = options;
+  const emit = options.onEvent ?? (() => {});
   const tickMs = defaultConfig.tickMs;
   const dataDir = await mkdtemp(join(tmpdir(), 'chaosim-cluster-'));
 
   const seen = new Set<string>();
   const distinctAlerts = new Map<string, number>();
   let duplicatesDropped = 0;
+  let feeder: ReturnType<typeof setInterval> | undefined;
   const cluster = await ShardCluster.start({
     dataDir,
     shards,
@@ -79,7 +117,7 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
     const workloads = ids.map((id, i) => ({ id, counts: scenarioCounts(i + 1, tickMs) }));
 
     let fed = 0;
-    const feeder = setInterval(() => {
+    feeder = setInterval(() => {
       const tick = fed % SCENARIO_TICKS;
       for (const { id, counts } of workloads) {
         counts[tick]!.forEach((count, code) => {
@@ -89,7 +127,10 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
       fed += 1;
     }, tickMs);
 
-    let recovery: RecoveryReport | null = null;
+    const recoveries: RecoveryReport[] = [];
+    let killsIssued = 0;
+    let second = 0;
+    let accepting = true;
     const worst: ShardHealth = {
       busyRatio: 0,
       lagP99Ms: 0,
@@ -99,20 +140,36 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
     };
     const previous = new Map<number, { tick: number; walBytes: number }>();
 
-    for (let second = 1; second <= seconds; second += 1) {
-      await sleep(1000);
+    const killShard = async (shardId: number): Promise<void> => {
+      if (!accepting) throw new Error('the run is ending');
+      const recovered = cluster.killShard(shardId);
+      // A shard that cannot be killed has refused by now; one that can is still recovering.
+      await Promise.race([recovered, Promise.resolve()]);
+      killsIssued += 1;
+      log(`        killing shard ${shardId}: worker terminated, no flush, no checkpoint`);
+      emit({ type: 'killed', shardId, second });
+      recovered.then(
+        (report) => {
+          recoveries.push(report);
+          log(
+            `        shard ${shardId} is back: replayed ${report.ticksReplayed} ticks after checkpoint ` +
+              `seq ${report.checkpointSeq ?? 'none'} in ${report.durationMs.toFixed(1)}ms`,
+          );
+          emit({ type: 'recovered', shardId, second, report });
+        },
+        (error: unknown) => {
+          log(`        shard ${shardId} did not come back: ${String(error)}`);
+          emit({ type: 'kill-failed', shardId, second, error: String(error) });
+        },
+      );
+    };
+    options.onControl?.({ killShard });
+    emit({ type: 'started', shards, sessions: ids.length, seconds });
+
+    for (second = 1; second <= seconds; second += 1) {
+      await sleep(1000, undefined, signal === undefined ? {} : { signal });
       if (options.killAtSecond === second) {
-        log('        killing shard 0: worker terminated, no flush, no checkpoint');
-        void cluster.killShard(0).then(
-          (report) => {
-            recovery = report;
-            log(
-              `        shard 0 is back: replayed ${report.ticksReplayed} ticks after checkpoint ` +
-                `seq ${report.checkpointSeq ?? 'none'} in ${report.durationMs.toFixed(1)}ms`,
-            );
-          },
-          (error: unknown) => log(`        shard 0 did not come back: ${String(error)}`),
-        );
+        void killShard(0).catch((error: unknown) => log(`        shard 0 did not come back: ${String(error)}`));
       }
 
       const stats = await cluster.stats();
@@ -120,18 +177,35 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
       let ticks = 0;
       let walBytes = 0;
       const now: ShardHealth = { busyRatio: 0, lagP99Ms: 0, fsyncP99Ms: 0, checkpointFreezeMs: 0, checkpointBytes: 0 };
-      for (const { shardId, stats: s } of stats.shards) {
-        if (s === null) continue;
+      const lines: ShardLine[] = [];
+      for (const { shardId, state, restarts, stats: s } of stats.shards) {
+        if (s === null) {
+          lines.push({
+            shardId, state, restarts,
+            ticksPerSec: null, busyRatio: null, lagP99Ms: null, fsyncP99Ms: null, walBytesPerSec: null,
+          });
+          continue;
+        }
         up += 1;
         const before = previous.get(shardId) ?? { tick: 0, walBytes: 0 };
-        ticks += Math.max(0, s.tick - before.tick);
-        walBytes += Math.max(0, s.wal.bytesWritten - before.walBytes);
+        const shardTicks = Math.max(0, s.tick - before.tick);
+        const shardWalBytes = Math.max(0, s.wal.bytesWritten - before.walBytes);
+        ticks += shardTicks;
+        walBytes += shardWalBytes;
         previous.set(shardId, { tick: s.tick, walBytes: s.wal.bytesWritten });
         now.busyRatio = Math.max(now.busyRatio, s.loop.busyRatio);
         now.lagP99Ms = Math.max(now.lagP99Ms, s.loop.lagP99Ms);
         now.fsyncP99Ms = Math.max(now.fsyncP99Ms, s.wal.fsyncP99Ms);
         now.checkpointFreezeMs = Math.max(now.checkpointFreezeMs, s.checkpoints.lastFreezeMs);
         now.checkpointBytes = Math.max(now.checkpointBytes, s.checkpoints.lastBytes);
+        lines.push({
+          shardId, state, restarts,
+          ticksPerSec: shardTicks,
+          busyRatio: s.loop.busyRatio,
+          lagP99Ms: s.loop.lagP99Ms,
+          fsyncP99Ms: s.wal.fsyncP99Ms,
+          walBytesPerSec: shardWalBytes,
+        });
       }
       for (const key of Object.keys(worst) as (keyof ShardHealth)[]) {
         worst[key] = Math.max(worst[key], now[key]);
@@ -143,7 +217,9 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
           `fsync p99 ${now.fsyncP99Ms.toFixed(1)}ms  wal ${(walBytes / 1024).toFixed(0)} KB/s  ` +
           `alerts ${seen.size}`,
       );
+      emit({ type: 'stats', second, seconds, alerts: seen.size, shards: lines });
     }
+    accepting = false;
     clearInterval(feeder);
 
     const attestations = await Promise.all(ids.map((id) => cluster.complete(id)));
@@ -177,23 +253,29 @@ export async function runClusterDemo(options: ClusterDemoOptions): Promise<Clust
         detail: `${signed.filter((n) => n > 0).length} signed, ${undelivered} undelivered`,
       },
     ];
-    if (options.killAtSecond !== undefined) {
-      const report = recovery as RecoveryReport | null;
+    const expected = Math.max(killsIssued, options.killAtSecond === undefined ? 0 : 1);
+    if (expected > 0) {
       checks.push({
         label: 'The killed shard recovered and rejoined',
-        ok: report !== null,
-        detail: report ? `replayed ${report.ticksReplayed} ticks in ${report.durationMs.toFixed(1)}ms` : 'never came back',
+        ok: recoveries.length === expected,
+        detail:
+          recoveries.length === 0
+            ? 'never came back'
+            : recoveries
+                .map((r) => `replayed ${r.ticksReplayed} ticks in ${r.durationMs.toFixed(1)}ms`)
+                .join(', ') + (recoveries.length < expected ? `, ${expected - recoveries.length} never came back` : ''),
       });
     }
 
     return {
       sessionsPerShard: ids.length / shards,
       worst,
-      recovery,
+      recovery: recoveries.at(-1) ?? null,
       alerts: { delivered: seen.size, duplicatesDropped },
       checks,
     };
   } finally {
+    clearInterval(feeder);
     await cluster.close();
     await rm(dataDir, { recursive: true, force: true });
   }

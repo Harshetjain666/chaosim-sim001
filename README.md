@@ -20,6 +20,7 @@ node src/index.ts --trace  # same, with a per second metrics table
 node src/index.ts --live   # drive the engine in real time for ~30 seconds
 node src/index.ts --cluster      # thousands of sessions on worker shards in real time, one shard killed mid run
 node src/index.ts --crash-drill  # SIGKILL a sharded cluster twice and prove recovery is exact
+node src/index.ts --serve        # the cluster demo in a browser, at http://127.0.0.1:3000
 node --test                # run the unit suite
 ```
 
@@ -37,6 +38,22 @@ The engine also runs sharded. `src/cluster/` puts sessions on worker thread shar
 
 * `--cluster` runs it in real time. By default that is 4,000 sessions on 4 shards for 30 seconds, every session fed the chaos scenario, with shard 0 killed at 21 seconds, right as the traps start to trip. It prints shard health every second, then checks that every attestation verifies as its own session's, that the trap fired at most once per session, and that every alert reached the consumer once after dedup. `--shards=N`, `--sessions=N`, `--seconds=N` and `--kill-at=S` change the run, and `--kill-at=0` leaves every shard alive.
 * `--crash-drill` kills a cluster process with SIGKILL twice, once while it is writing and once at a known point, then recovers it in a fresh process. It checks that no acknowledged tick was lost, that every recovered session is bit identical to the engine that never crashed, and that every session still finishes on its reference fingerprint.
+
+## Watch it in a browser
+
+```bash
+npm run serve          # or: node src/index.ts --serve
+```
+
+Open <http://127.0.0.1:3000>. `--port=N`, `--shards=N`, `--sessions=N` and `--seconds=N` change it; the defaults are port 3000 and the same 4,000 sessions on 4 shards for 30 seconds that `--cluster` runs. `--port=0` picks a free port and prints it.
+
+The page shows a card per shard (up, down or failed, ticks per second, busy share of one core, loop lag p99, fsync p99, WAL KB/s, restarts), a running count of alerts, and a log of what happened to the cluster. **Start run** starts the demo, and **Kill shard N** terminates that shard's worker the hard way, with no flush and no checkpoint. The log then shows the shard killed and, a moment later, back with how many ticks it replayed from its write ahead log. When the run ends the page lists the acceptance checks, the same ones `--cluster` prints. A killed shard is held to the same check that it recovered. Refresh the page mid run and it catches up from the server.
+
+It is the same `runClusterDemo` and `ShardCluster` that `--cluster` uses, with an event callback added to the demo, and it has no dependencies: the server is `node:http` and the page is one HTML document with its CSS and JS inline.
+
+* One run at a time. Every run gets a fresh temporary data directory that is removed when the run ends, so nothing carries over between runs. Ctrl-C or SIGTERM stops a live run, closes the cluster so the directory lock is released, removes the directory, and exits.
+* It listens on 127.0.0.1 only, and refuses requests whose `Host` is not loopback or whose `Origin` is another site, so a web page you happen to have open cannot start a run or kill a shard.
+* `GET /events` is the stream (Server-Sent Events: `snapshot` on connect, then `run`, `started`, one `stats` frame per second, `killed`, `recovered`, `finished`). `POST /start` starts a run, `POST /kill/N` kills shard N. A shard that is not a whole number below the shard count is a 400, and a kill with no live run, or of a shard that is already down, is a 409.
 
 ## Project layout
 
@@ -72,6 +89,9 @@ src/
     crashDrill.ts      the SIGKILL drill
     crashDrillChild.ts the process the drill kills
     clusterDemo.ts     the real time demo
+  dashboard/
+    server.ts          the local web dashboard: node:http, Server-Sent Events, one run at a time
+    page.ts            the page, one HTML document with inline CSS and JS
 test/
   sim.test.ts          determinism, trap once, stress curve, attestation
   snapshot.test.ts     freezing and resuming the engine
@@ -82,6 +102,7 @@ test/
   cluster.test.ts      placement, sharded runs, shard kill, restart, manifest, crash loops
   crashDrill.test.ts   the SIGKILL drill
   clusterDemo.test.ts  real time smoke test
+  dashboard.test.ts    the dashboard over real HTTP: stream, kill guards, runs, SIGINT
 docs/
   ARCHITECTURE_BRIEF.md  Challenge 1 and 2 answers, design notes, production path
   SCALE_OUT.md           sharding, the write ahead log, recovery, and what each failure costs

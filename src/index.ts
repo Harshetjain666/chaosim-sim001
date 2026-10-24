@@ -8,6 +8,7 @@ import { runLiveLoop } from './liveLoop.ts';
 import { CEO_ALERT_MESSAGE } from './scenarioDirector.ts';
 import { runCrashDrill } from './cluster/crashDrill.ts';
 import { runClusterDemo } from './cluster/clusterDemo.ts';
+import { startDashboard } from './dashboard/server.ts';
 import type { WorldState } from './types.ts';
 
 const SECRET = process.env.CHAOSIM_SECRET ?? 'sim-001-dev-secret';
@@ -150,6 +151,38 @@ async function runCluster(argv: string[]): Promise<void> {
   printChecks(result.checks);
 }
 
+/**
+ * The cluster demo behind a local web page. Runs until it is interrupted;
+ * Ctrl-C (or SIGTERM) stops a live run and removes its data directory first.
+ */
+async function runServe(argv: string[]): Promise<void> {
+  const dashboard = await startDashboard({
+    secret: SECRET,
+    port: numberFlag(argv, 'port', 3000),
+    shards: numberFlag(argv, 'shards', 4),
+    sessions: numberFlag(argv, 'sessions', 4000),
+    seconds: numberFlag(argv, 'seconds', 30),
+  });
+  console.log(rule());
+  console.log('SIM-001  Cluster Dashboard');
+  console.log(rule());
+  console.log(`Open ${dashboard.url}  (Ctrl-C to stop)`);
+
+  const stop = (signal: NodeJS.Signals): void => {
+    console.log(`\n${signal}: stopping the run and releasing the data directory`);
+    dashboard.close().then(
+      () => console.log('stopped'),
+      (error: unknown) => {
+        console.error(error);
+        process.exitCode = 1;
+      },
+    );
+  };
+  // Once, so a second signal while closing takes the default action and ends the process.
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+}
+
 async function runLive(seed: number): Promise<void> {
   const config = defaultConfig;
   const sim = new Simulation({ secret: SECRET, config });
@@ -196,6 +229,10 @@ async function main(): Promise<void> {
   }
   if (argv.includes('--cluster')) {
     await runCluster(argv);
+    return;
+  }
+  if (argv.includes('--serve')) {
+    await runServe(argv);
     return;
   }
 
