@@ -1,12 +1,13 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { defaultConfig, defaultShardConfig } from '../src/config.ts';
-import { ShardCluster, exitAction, type ClusterOptions } from '../src/cluster/cluster.ts';
+import { ShardCluster, exitAction, workerExecArgv, type ClusterOptions } from '../src/cluster/cluster.ts';
 import { ClusterError } from '../src/cluster/errors.ts';
 import { shardFor } from '../src/cluster/placement.ts';
 import { segmentName } from '../src/cluster/wal.ts';
@@ -132,6 +133,22 @@ test('a shard that dies after coming up is restarted even while the others are s
   );
   assert.equal(exitAction({ closing: false, booting: false, wasReady: true }), 'restart');
   assert.equal(exitAction({ closing: true, booting: false, wasReady: true }), 'close');
+});
+
+test('shards inherit node options, minus the ones that describe an -e or stdin entry point', () => {
+  assert.equal(workerExecArgv([]), undefined);
+  assert.equal(
+    workerExecArgv(['--max-old-space-size=200', '-e', 'code']),
+    undefined,
+    'left to inheritance, since a worker refuses V8 options in an explicit list',
+  );
+  assert.deepEqual(workerExecArgv(['--input-type=module']), [], 'stdin');
+  assert.deepEqual(workerExecArgv(['--input-type', 'module', '-e', 'code']), []);
+  assert.deepEqual(workerExecArgv(['--input-type=commonjs', '-pe', 'code']), []);
+  assert.deepEqual(
+    workerExecArgv(['--experimental-strip-types', '--input-type=module', '--eval=code', '--import', 'tsx', '--conditions=dev']),
+    ['--experimental-strip-types', '--import', 'tsx', '--conditions=dev'],
+  );
 });
 
 test('growing the cluster moves only the sessions the new shard wins', () => {
@@ -418,5 +435,24 @@ describe('a running cluster', { concurrency: true }, () => {
     await after.resync();
     await runToEnd(after);
     assertReferenceFingerprints(after, sessions);
+  });
+
+  test('a cluster started by node --input-type=module -e starts its shards', async (t) => {
+    const { dir } = await harness(t);
+    const clusterModule = new URL('../src/cluster/cluster.ts', import.meta.url).href;
+    const script = [
+      `import { ShardCluster } from ${JSON.stringify(clusterModule)};`,
+      `const cluster = await ShardCluster.start({ dataDir: ${JSON.stringify(dir)}, shards: 2, secret: 'test', clock: 'manual' });`,
+      `console.log(await cluster.openSession('a'));`,
+      'await cluster.close();',
+    ].join('\n');
+    // Node 22.6 to 23.5 needs the type stripping flag passed on, as the crash drill does.
+    const typeScript = process.execArgv.filter(
+      (flag) => flag.startsWith('--experimental-strip-types') || flag.startsWith('--experimental-transform-types'),
+    );
+    const { stdout } = await promisify(execFile)(process.execPath, [...typeScript, '--input-type=module', '-e', script], {
+      timeout: 30_000,
+    });
+    assert.equal(stdout, 'opened\n');
   });
 });
